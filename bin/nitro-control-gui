@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""
+nitro-control-gui — unified Qt (PySide6) control panel for the Acer Nitro
+AN517-41 on Linux/KDE. Capability-driven. RGB is driven by a persistent
+`nitro-rgb-fx daemon` reading a live state file, so changes are smooth.
+
+Run:   nitro-control-gui [--minimized]
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, QSize
+from PySide6.QtGui import QAction, QColor, QIcon, QLinearGradient, QPainter, QPixmap, QBrush
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
+    QHBoxLayout, QGridLayout, QTabWidget, QCheckBox, QSlider, QColorDialog,
+    QGroupBox, QSystemTrayIcon, QMenu, QMessageBox, QFrame, QListWidget,
+    QListWidgetItem, QComboBox, QProgressBar,
+)
+
+NITROCTL = "nitroctl"
+RGB = "nitro-rgb-fx"
+STATE_FILE = Path.home() / ".config" / "nitro-control" / "rgb-state.json"
+DAEMON_PID = Path.home() / ".config" / "nitro-control" / "rgb-daemon.pid"
+ACCENT = "#8a2be2"
+ACCENT2 = "#00e5ff"
+GREEN = "#3ad07a"
+AMBER = "#ffb020"
+RED = "#ff5a5a"
+
+EFFECTS = [
+    ("🌈  Rainbow", "rainbow"), ("🌈  Rainbow Breathe", "rainbowbreathe"),
+    ("🫧  Plasma", "plasma"), ("🌌  Aurora", "aurora"),
+    ("🌊  Ocean", "ocean"), ("🌆  Vaporwave", "vaporwave"),
+    ("💨  Breathe", "breathe"), ("〰️  Wave", "wave"),
+    ("☄️  Comet", "comet"), ("🔦  Scanner", "scanner"),
+    ("⭐  Meteor", "meteor"), ("🏃  Chase", "chase"),
+    ("🔥  Fire", "fire"), ("🕯️  Candle", "candle"),
+    ("💓  Pulse", "pulse"), ("❤️  Heartbeat", "heartbeat"),
+    ("✨  Twinkle", "twinkle"), ("⚡  Lightning", "lightning"),
+    ("🟩  Matrix", "matrix"), ("🔄  Cycle", "cycle"),
+    ("🪩  Disco", "disco"), ("🎄  Holiday", "holiday"),
+    ("🌅  Sunrise", "sunrise"), ("🆘  SOS", "sos"),
+    ("⬛  Solid", "solid"), ("🎚️  Gradient", "gradient"),
+    ("🔊  Sound bar", "sound"), ("🔊  Sound pulse", "soundwave"),
+    ("📊  CPU meter", "cpu"), ("🌡️  Temp meter", "temp"),
+    ("🔋  Battery meter", "battery"),
+]
+
+PRESETS = [
+    ("Red", "#ff2d2d"), ("Orange", "#ff7b1a"), ("Yellow", "#ffd21a"),
+    ("Green", "#00e05a"), ("Teal", "#00e0a0"), ("Cyan", "#00e5ff"),
+    ("Blue", "#2b6bff"), ("Purple", "#9628ff"), ("Pink", "#ff2b8f"),
+    ("White", "#ffffff"),
+]
+
+# (label, seconds); 0 = never
+AUTO_OFF = [
+    ("10 seconds", 10), ("20 seconds", 20), ("30 seconds", 30),
+    ("1 minute", 60), ("2 minutes", 120), ("3 minutes", 180),
+    ("5 minutes", 300), ("10 minutes", 600), ("20 minutes", 1200),
+    ("30 minutes", 1800), ("1 hour", 3600), ("Never", 0),
+]
+
+QSS = f"""
+* {{ font-size: 13px; }}
+QMainWindow, QWidget {{ background: #14161b; color: #e7e9f0; }}
+QTabWidget::pane {{ border: none; background: transparent; }}
+QTabBar {{ qproperty-drawBase: 0; }}
+QTabBar::tab {{ background: transparent; padding: 9px 18px; color: #8b91a0; border: none; }}
+QTabBar::tab:selected {{ color: #ffffff; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:hover {{ color: #c9cdd8; }}
+QGroupBox {{ background: #1c1f27; border: 1px solid #2b2f3a; border-radius: 12px;
+            margin-top: 16px; padding: 16px 14px 12px 14px; font-weight: 600; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 14px; padding: 0 6px; color: #9aa0ad; }}
+QFrame#card {{ background: #1c1f27; border: 1px solid #2b2f3a; border-radius: 12px; }}
+QPushButton {{ background: #262a34; border: 1px solid #333846; border-radius: 9px; padding: 8px 12px; }}
+QPushButton:hover {{ background: #2f3542; border-color: {ACCENT}; }}
+QPushButton:pressed {{ background: #382a55; }}
+QPushButton#accent {{ background: qlineargradient(x1:0 y1:0 x2:1 y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2});
+                      color: white; border: none; font-weight: 700; }}
+QPushButton#accent:hover {{ background: qlineargradient(x1:0 y1:0 x2:1 y2:0, stop:0 #9d43f0, stop:1 #33ecff); }}
+QListWidget {{ background: #171a21; border: 1px solid #2b2f3a; border-radius: 10px; padding: 5px; outline: none; }}
+QListWidget::item {{ padding: 9px 10px; border-radius: 7px; margin: 1px; }}
+QListWidget::item:selected {{ background: {ACCENT}; color: white; }}
+QListWidget::item:hover {{ background: #262a34; }}
+QSlider {{ min-height: 22px; }}
+QSlider::groove:horizontal {{ height: 6px; background: #2b2f3a; border-radius: 3px; }}
+QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0 y1:0 x2:1 y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2}); border-radius: 3px; }}
+QSlider::handle:horizontal {{ width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; background: white; }}
+QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 5px; border: 1px solid #3a3f4c; background: #23262f; }}
+QCheckBox::indicator:checked {{ background: {GREEN}; border-color: {GREEN}; }}
+QComboBox {{ background: #23262f; border: 1px solid #333846; border-radius: 7px; padding: 6px 10px; min-width: 120px; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox QAbstractItemView {{ background: #1c1f27; border: 1px solid #2b2f3a; outline: none;
+                               selection-background-color: {ACCENT}; padding: 4px; }}
+QProgressBar {{ background: #23262f; border: none; border-radius: 4px; }}
+QProgressBar::chunk {{ border-radius: 4px; background: qlineargradient(x1:0 y1:0 x2:1 y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2}); }}
+QLabel#h1 {{ font-size: 17px; font-weight: 700; }}
+QLabel#muted {{ color: #8b91a0; }}
+QLabel#stattitle {{ color: #8b91a0; font-size: 11px; letter-spacing: 1px; }}
+"""
+
+
+def nitroctl(*args, timeout=8):
+    try:
+        p = subprocess.run([NITROCTL, *args], capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def caps():
+    _, out, _ = nitroctl("caps", "--json")
+    try:
+        return json.loads(out)
+    except Exception:
+        return {}
+
+
+def temp_color(c):
+    if c is None:
+        return None
+    if c >= 85:
+        return RED
+    if c >= 72:
+        return AMBER
+    return GREEN
+
+
+def make_icon():
+    pm = QPixmap(64, 64)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    g = QLinearGradient(0, 0, 64, 64)
+    g.setColorAt(0, QColor(ACCENT))
+    g.setColorAt(1, QColor(ACCENT2))
+    p.setBrush(QBrush(g))
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(6, 6, 52, 52, 15, 15)
+    p.setPen(QColor("white"))
+    f = p.font(); f.setBold(True); f.setPointSize(30); p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, "N")
+    p.end()
+    return QIcon(pm)
+
+
+class ToggleSwitch(QCheckBox):
+    """A clear sliding on/off switch (green = on, grey = off)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(56, 30)
+
+    def sizeHint(self):
+        return QSize(56, 30)
+
+    def hitButton(self, pos):
+        return self.contentsRect().contains(pos)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        on = self.isChecked()
+        p.setBrush(QColor(GREEN if on else "#3a3f4c"))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 3, 56, 24, 12, 12)
+        p.setBrush(QColor("white"))
+        p.drawEllipse(31 if on else 3, 5, 20, 20)
+        p.end()
+
+
+class StatCard(QFrame):
+    def __init__(self, icon, title, bar=False):
+        super().__init__()
+        self.setObjectName("card")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        ic = QLabel(icon); ic.setStyleSheet("font-size: 15px;")
+        tt = QLabel(title); tt.setObjectName("stattitle")
+        top.addWidget(ic); top.addSpacing(4); top.addWidget(tt); top.addStretch()
+        lay.addLayout(top)
+        self.v = QLabel("—")
+        self.v.setStyleSheet("font-size: 21px; font-weight: 700;")
+        lay.addWidget(self.v)
+        self.bar = None
+        if bar:
+            self.bar = QProgressBar()
+            self.bar.setTextVisible(False)
+            self.bar.setRange(0, 100)
+            self.bar.setFixedHeight(6)
+            lay.addWidget(self.bar)
+
+    def set(self, val, color=None):
+        self.v.setText(str(val))
+        self.v.setStyleSheet(
+            f"font-size: 21px; font-weight: 700; color: {color};" if color
+            else "font-size: 21px; font-weight: 700;")
+
+    def set_bar(self, pct):
+        if self.bar is not None and pct is not None:
+            self.bar.setValue(int(pct))
+
+
+class Poller(QThread):
+    updated = Signal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self._run = True
+        self._paused = False
+
+    def run(self):
+        while self._run:
+            if not self._paused:
+                _, out, _ = nitroctl("status", "--json")
+                try:
+                    self.updated.emit(json.loads(out))
+                except Exception:
+                    self.updated.emit({})
+            for _ in range(20):
+                if not self._run:
+                    return
+                self.msleep(100)
+
+    def pause(self, v):
+        self._paused = v
+
+    def stop(self):
+        self._run = False
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.caps = caps()
+        self.color = "#9628ff"
+        self.auto_color = True
+        self._last_effect = "gradient"
+        self._is_off = False
+        self.daemon_proc = None
+
+        self.setWindowTitle("Nitro Control")
+        self.setWindowIcon(make_icon())
+        self.resize(720, 600)
+
+        self._apply_timer = QTimer(self); self._apply_timer.setSingleShot(True)
+        self._apply_timer.timeout.connect(self.apply)
+
+        central = QWidget(); outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        outer.addWidget(self._header())
+        tabs = QTabWidget()
+        tabs.addTab(self._dashboard_tab(), "  Dashboard  ")
+        if self.caps.get("battery"):
+            tabs.addTab(self._battery_tab(), "  Battery  ")
+        if self.caps.get("keyboard"):
+            tabs.addTab(self._keyboard_tab(), "  Keyboard  ")
+        tabs.addTab(self._fans_tab(), "  Fans  ")
+        tabs.addTab(self._about_tab(), "  About  ")
+        outer.addWidget(tabs)
+        self.setCentralWidget(central)
+
+        self._make_tray()
+        self._ensure_daemon()
+        self.poller = Poller()
+        self.poller.updated.connect(self.on_status)
+        self.poller.start()
+
+    def _header(self):
+        h = QFrame()
+        lay = QHBoxLayout(h); lay.setContentsMargins(18, 14, 18, 14)
+        dot = QLabel("●"); dot.setStyleSheet(f"color: {ACCENT2}; font-size: 18px;")
+        title = QLabel("Nitro Control"); title.setObjectName("h1")
+        sub = QLabel("Acer Nitro AN517-41 · Fedora KDE"); sub.setObjectName("muted")
+        col = QVBoxLayout(); col.setSpacing(0); col.addWidget(title); col.addWidget(sub)
+        lay.addWidget(dot); lay.addSpacing(8); lay.addLayout(col); lay.addStretch()
+        return h
+
+    # ---- Dashboard ----
+    def _dashboard_tab(self):
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(18, 18, 18, 18)
+        grid = QGridLayout(); grid.setSpacing(12)
+        self.s_cpu = StatCard("🔥", "CPU TEMP")
+        self.s_gpu = StatCard("🎮", "GPU  ·  NVIDIA")
+        self.s_igpu = StatCard("💻", "iGPU TEMP")
+        self.s_batt = StatCard("🔋", "BATTERY", bar=True)
+        self.s_ac = StatCard("🔌", "POWER")
+        self.s_limit = StatCard("🛡️", "80% CHARGE LIMIT")
+        cards = [self.s_cpu, self.s_gpu, self.s_igpu, self.s_batt, self.s_ac, self.s_limit]
+        for i, c in enumerate(cards):
+            grid.addWidget(c, i // 3, i % 3)
+        lay.addLayout(grid); lay.addStretch()
+        note = QLabel("Live values refresh every ~2 s and pause when the window is hidden.")
+        note.setObjectName("muted"); lay.addWidget(note)
+        return w
+
+    # ---- Battery ----
+    def _battery_tab(self):
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(18, 18, 18, 18)
+        box = QGroupBox("Charge health limit")
+        bl = QVBoxLayout(box)
+        row = QHBoxLayout()
+        lab = QLabel("Limit charging to 80 %")
+        lab.setStyleSheet("font-size: 14px;")
+        self.batt_status_lbl = QLabel("—")
+        self.batt_status_lbl.setStyleSheet("font-weight: 700;")
+        self.batt_switch = ToggleSwitch()
+        self.batt_switch.toggled.connect(self.set_battery)
+        row.addWidget(lab); row.addStretch()
+        row.addWidget(self.batt_status_lbl); row.addSpacing(10); row.addWidget(self.batt_switch)
+        bl.addLayout(row)
+        self.batt_state = QLabel("—"); self.batt_state.setObjectName("muted")
+        bl.addWidget(self.batt_state)
+        rr = QHBoxLayout()
+        reapply = QPushButton("Re-apply now")
+        reapply.clicked.connect(lambda: (nitroctl("battery", "apply-saved"), self.refresh_once()))
+        rr.addWidget(reapply); rr.addStretch(); bl.addLayout(rr)
+        lay.addWidget(box)
+
+        info = QGroupBox("Battery health")
+        il = QVBoxLayout(info)
+        self.batt_wear = QLabel("—"); il.addWidget(self.batt_wear)
+        lay.addWidget(info)
+        note = QLabel("Protects long-term battery lifespan. If already above 80 %, enabling won't "
+                      "discharge — it just stops topping up on the next charge. Re-applied "
+                      "automatically at every boot and resume, so it never silently resets.")
+        note.setWordWrap(True); note.setObjectName("muted"); lay.addWidget(note)
+        lay.addStretch()
+        return w
+
+    # ---- Keyboard ----
+    def _keyboard_tab(self):
+        w = QWidget(); root = QHBoxLayout(w); root.setContentsMargins(18, 18, 18, 18); root.setSpacing(16)
+
+        self.eff_list = QListWidget()
+        for label, key in EFFECTS:
+            it = QListWidgetItem(label); it.setData(Qt.UserRole, key)
+            self.eff_list.addItem(it)
+        self.eff_list.setCurrentRow(2)  # plasma
+        self.eff_list.currentItemChanged.connect(lambda *_: self.schedule_apply())
+        root.addWidget(self.eff_list, 3)
+
+        panel = QVBoxLayout(); panel.setSpacing(12)
+
+        cbox = QGroupBox("Colour theme")
+        cl = QVBoxLayout(cbox)
+        sw = QGridLayout(); sw.setSpacing(6)
+        for i, (name, hexv) in enumerate(PRESETS):
+            b = QPushButton(); b.setFixedSize(30, 30); b.setToolTip(name)
+            b.setStyleSheet(f"background:{hexv}; border:1px solid #333846; border-radius:6px;")
+            b.clicked.connect(lambda _=False, h=hexv: self.set_color(h))
+            sw.addWidget(b, i // 5, i % 5)
+        cl.addLayout(sw)
+        row = QHBoxLayout()
+        custom = QPushButton("Custom…"); custom.clicked.connect(self.pick_color)
+        self.auto_chk = QCheckBox("Natural (per-effect)")
+        self.auto_chk.setChecked(True); self.auto_chk.toggled.connect(self.on_auto_toggle)
+        self.color_preview = QLabel(); self.color_preview.setFixedSize(26, 26)
+        row.addWidget(custom); row.addWidget(self.auto_chk); row.addStretch()
+        row.addWidget(QLabel("Now:")); row.addWidget(self.color_preview)
+        cl.addLayout(row)
+        panel.addWidget(cbox)
+        self._paint_preview()
+
+        sbox = QGroupBox("Adjust"); sg = QGridLayout(sbox); sg.setVerticalSpacing(14)
+        sg.addWidget(QLabel("Brightness"), 0, 0)
+        self.bright = QSlider(Qt.Horizontal); self.bright.setRange(1, 100); self.bright.setValue(100)
+        self.bright.valueChanged.connect(lambda *_: self.schedule_apply())
+        self.bright_lbl = QLabel("100%"); self.bright_lbl.setObjectName("muted"); self.bright_lbl.setFixedWidth(48)
+        sg.addWidget(self.bright, 0, 1); sg.addWidget(self.bright_lbl, 0, 2)
+        sg.addWidget(QLabel("Speed"), 1, 0)
+        self.speed = QSlider(Qt.Horizontal); self.speed.setRange(1, 30); self.speed.setValue(10)
+        self.speed.valueChanged.connect(lambda *_: self.schedule_apply())
+        self.speed_lbl = QLabel("1.0×"); self.speed_lbl.setObjectName("muted"); self.speed_lbl.setFixedWidth(48)
+        sg.addWidget(self.speed, 1, 1); sg.addWidget(self.speed_lbl, 1, 2)
+        sg.addWidget(QLabel("Intensity"), 2, 0)
+        self.amp = QSlider(Qt.Horizontal); self.amp.setRange(2, 30); self.amp.setValue(10)
+        self.amp.valueChanged.connect(lambda *_: self.schedule_apply())
+        self.amp_lbl = QLabel("1.0×"); self.amp_lbl.setObjectName("muted"); self.amp_lbl.setFixedWidth(48)
+        sg.addWidget(self.amp, 2, 1); sg.addWidget(self.amp_lbl, 2, 2)
+        sg.addWidget(QLabel("Turn off when idle"), 3, 0)
+        self.autooff = QComboBox()
+        for label, secs in AUTO_OFF:
+            self.autooff.addItem(label, secs)
+        self.autooff.setCurrentIndex(self.autooff.count() - 1)  # default: Never
+        self.autooff.currentIndexChanged.connect(lambda *_: self.schedule_apply())
+        sg.addWidget(self.autooff, 3, 1)
+        panel.addWidget(sbox)
+
+        brow = QHBoxLayout()
+        self.offbtn = QPushButton("Turn off"); self.offbtn.clicked.connect(self.toggle_off)
+        setb = QPushButton("Set as boot default"); setb.setObjectName("accent")
+        setb.clicked.connect(self.set_default_effect)
+        brow.addWidget(self.offbtn); brow.addStretch(); brow.addWidget(setb)
+        panel.addLayout(brow); panel.addStretch()
+        root.addLayout(panel, 4)
+        return w
+
+    # ---- Fans / About ----
+    def _fans_tab(self):
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(18, 18, 18, 18)
+        box = QGroupBox("Fan control")
+        bl = QVBoxLayout(box)
+        if self.caps.get("fans"):
+            bl.addWidget(QLabel("Fan interface detected but not yet wired into the GUI."))
+        else:
+            t = QLabel("Not available on this model")
+            t.setStyleSheet("font-size: 15px; font-weight: 600;")
+            b = QLabel("This 2021 AMD Nitro exposes no platform_profile and no fan interface, and "
+                       "the driver that could add one (Linuwu-Sense) conflicts with the RGB "
+                       "keyboard driver we use. See FANS.md for the full explanation and a safe "
+                       "path forward for contributors.")
+            b.setWordWrap(True); b.setObjectName("muted")
+            bl.addWidget(t); bl.addWidget(b)
+        lay.addWidget(box); lay.addStretch()
+        return w
+
+    def _about_tab(self):
+        w = QWidget(); lay = QVBoxLayout(w); lay.setContentsMargins(18, 18, 18, 18)
+        box = QGroupBox("Detected capabilities")
+        bl = QVBoxLayout(box)
+        cap_txt = "\n".join(f"  {k:16s}: {'✓ yes' if v else '✗ no'}" for k, v in self.caps.items())
+        lbl = QLabel(cap_txt); lbl.setStyleSheet("font-family: monospace;")
+        bl.addWidget(lbl)
+        lay.addWidget(box)
+        diag = QPushButton("Copy diagnostic bundle"); diag.clicked.connect(self.copy_diag)
+        lay.addWidget(diag)
+        lay.addStretch()
+        credit = QLabel("nitro-control · battery + RGB for Acer Nitro on Linux")
+        credit.setObjectName("muted")
+        made = QLabel("Made by PlayMaker")
+        made.setStyleSheet("font-weight: 700; font-size: 14px;")
+        made.setAlignment(Qt.AlignRight)
+        lay.addWidget(credit); lay.addWidget(made)
+        return w
+
+    # ---- tray ----
+    def _make_tray(self):
+        self.tray = QSystemTrayIcon(make_icon(), self)
+        self.tray.setToolTip("Nitro Control")
+        m = QMenu()
+        self.tray_limit = QAction("80 % battery limit", self, checkable=True)
+        self.tray_limit.triggered.connect(self.set_battery)
+        m.addAction(self.tray_limit)
+        m.addSeparator()
+        for label, key in [("Rainbow", "rainbow"), ("Aurora", "aurora"),
+                           ("Ocean", "ocean"), ("Keyboard off", "off")]:
+            a = QAction(label, self)
+            a.triggered.connect(lambda _=False, k=key: self.apply(k))
+            m.addAction(a)
+        m.addSeparator()
+        show = QAction("Open Nitro Control", self); show.triggered.connect(self.showNormal)
+        m.addAction(show)
+        quit_a = QAction("Quit", self); quit_a.triggered.connect(self.quit_app)
+        m.addAction(quit_a)
+        self.tray.setContextMenu(m)
+        self.tray.activated.connect(
+            lambda r: self.showNormal() if r == QSystemTrayIcon.Trigger else None)
+        self.tray.show()
+
+    # ---- RGB daemon + live state ----
+    @staticmethod
+    def _pid_is_daemon(pid):
+        try:
+            return "nitro-rgb-fx" in open(f"/proc/{pid}/cmdline").read()
+        except Exception:
+            return False
+
+    def _ensure_daemon(self):
+        # Reuse a running daemon (effects persist across GUI restarts/quit).
+        try:
+            pid = int(DAEMON_PID.read_text())
+            if self._pid_is_daemon(pid):
+                self.daemon_proc = None
+                self.apply()
+                return
+        except Exception:
+            pass
+        # start_new_session=True so it survives the GUI process exiting.
+        try:
+            self.daemon_proc = subprocess.Popen([RGB, "daemon"], start_new_session=True)
+            DAEMON_PID.parent.mkdir(parents=True, exist_ok=True)
+            DAEMON_PID.write_text(str(self.daemon_proc.pid))
+        except Exception:
+            self.daemon_proc = None
+        self.apply()
+
+    def current_key(self):
+        it = self.eff_list.currentItem() if hasattr(self, "eff_list") else None
+        return it.data(Qt.UserRole) if it else "gradient"
+
+    def schedule_apply(self):
+        self.bright_lbl.setText(f"{self.bright.value()}%")
+        self.speed_lbl.setText(f"{self.speed.value() / 10:.1f}×")
+        self.amp_lbl.setText(f"{self.amp.value() / 10:.1f}×")
+        self._apply_timer.start(60)
+
+    def apply(self, effect=None):
+        eff = effect if effect is not None else self.current_key()
+        state = {
+            "effect": eff,
+            "brightness": self.bright.value(),
+            "speed": round(self.speed.value() / 10.0, 2),
+            "amplitude": round(self.amp.value() / 10.0, 2),
+            "color": (None if self.auto_color else self.color),
+            "idle_off": int(self.autooff.currentData() or 0),
+        }
+        try:
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            STATE_FILE.write_text(json.dumps(state))
+        except Exception:
+            pass
+        if eff != "off":
+            self._last_effect = eff
+        self._is_off = (eff == "off")
+        self._update_off_btn()
+
+    def toggle_off(self):
+        if self._is_off:
+            self.apply(self.current_key())   # turn back on with selected effect
+        else:
+            self.apply("off")
+
+    def _update_off_btn(self):
+        if hasattr(self, "offbtn"):
+            self.offbtn.setText("Turn on" if self._is_off else "Turn off")
+
+    # ---- colour ----
+    def set_color(self, hexv):
+        self.color = hexv
+        self.auto_color = False
+        self.auto_chk.blockSignals(True); self.auto_chk.setChecked(False); self.auto_chk.blockSignals(False)
+        self._paint_preview()
+        self.schedule_apply()
+
+    def pick_color(self):
+        c = QColorDialog.getColor(QColor(self.color), self, "Keyboard colour")
+        if c.isValid():
+            self.set_color(c.name())
+
+    def on_auto_toggle(self, v):
+        self.auto_color = v
+        self._paint_preview()
+        self.schedule_apply()
+
+    def _paint_preview(self):
+        if self.auto_color:
+            self.color_preview.setStyleSheet(
+                "border-radius:7px; border:1px solid #333846; background: qlineargradient("
+                "x1:0 y1:0 x2:1 y2:0, stop:0 #ff2d2d, stop:0.5 #00e05a, stop:1 #2b6bff);")
+        else:
+            self.color_preview.setStyleSheet(
+                f"border-radius:7px; border:1px solid #333846; background:{self.color};")
+
+    def set_default_effect(self):
+        args = ["kb", "set-default", self._last_effect,
+                "--brightness", str(self.bright.value()), "--speed", str(self.speed.value() / 10.0)]
+        if not self.auto_color:
+            args += ["--color", self.color]
+        nitroctl(*args)
+        self.tray.showMessage("Nitro Control", f"Boot default set to '{self._last_effect}'",
+                              make_icon(), 3000)
+
+    # ---- battery ----
+    def set_battery(self, on):
+        _, _, err = nitroctl("battery", "on" if on else "off")
+        if err:
+            QMessageBox.warning(self, "Battery", err + "\n\nIf you just installed, log out and "
+                                "back in so your user joins the 'nitro' group.")
+        self.refresh_once()
+
+    def copy_diag(self):
+        _, out, err = nitroctl("diag")
+        QApplication.clipboard().setText((out + "\n" + err).strip())
+        self.tray.showMessage("Nitro Control", "Diagnostic bundle copied to clipboard", make_icon(), 3000)
+
+    def refresh_once(self):
+        _, out, _ = nitroctl("status", "--json")
+        try:
+            self.on_status(json.loads(out))
+        except Exception:
+            pass
+
+    def on_status(self, s):
+        if not s:
+            return
+        b = s.get("battery", {}); cpu = s.get("cpu", {}); gpu = s.get("gpu", {})
+        ct = cpu.get("temp_c")
+        self.s_cpu.set(f"{ct} °C" if ct is not None else "n/a", temp_color(ct))
+        nv = gpu.get("nvidia")
+        if nv:
+            self.s_gpu.set(f"{nv['temp_c']} °C · {nv['power_w']} W", temp_color(nv["temp_c"]))
+        else:
+            self.s_gpu.set("n/a")
+        it = gpu.get("amd_temp_c")
+        self.s_igpu.set(f"{it} °C" if it is not None else "n/a", temp_color(it))
+        cap = b.get("capacity")
+        self.s_batt.set(f"{cap}%" if cap is not None else "n/a")
+        self.s_batt.set_bar(cap)
+        self.s_ac.set("Plugged" if b.get("ac_online") else "On battery")
+        hm = b.get("health_mode")
+        self.s_limit.set("ON" if hm else "OFF" if hm is not None else "n/a",
+                         GREEN if hm else None)
+        if hasattr(self, "batt_switch"):
+            self.batt_switch.blockSignals(True); self.batt_switch.setChecked(bool(hm)); self.batt_switch.blockSignals(False)
+            self.tray_limit.blockSignals(True); self.tray_limit.setChecked(bool(hm)); self.tray_limit.blockSignals(False)
+            self.batt_status_lbl.setText("ON" if hm else "OFF")
+            self.batt_status_lbl.setStyleSheet(f"font-weight:700; color:{GREEN if hm else '#8b91a0'};")
+            self.batt_state.setText(
+                f"Charge {b.get('capacity')} %  ·  {b.get('status')}  ·  "
+                f"{'plugged in' if b.get('ac_online') else 'on battery'}")
+            wear = b.get("wear_pct")
+            self.batt_wear.setText(
+                f"Wear: {wear} %   (full charge holds {b.get('energy_full', 0) // 1000} of "
+                f"{b.get('energy_full_design', 0) // 1000} mWh original design)"
+                if wear is not None else "Wear: n/a")
+
+    # ---- lifecycle ----
+    def hideEvent(self, e):
+        if hasattr(self, "poller"):
+            self.poller.pause(True)
+        super().hideEvent(e)
+
+    def showEvent(self, e):
+        if hasattr(self, "poller"):
+            self.poller.pause(False)
+        super().showEvent(e)
+
+    def closeEvent(self, e):
+        if self.tray.isVisible():
+            self.hide(); e.ignore()
+        else:
+            self.quit_app()
+
+    def quit_app(self):
+        # Leave the RGB daemon running so effects persist after the GUI exits.
+        self.poller.stop(); self.poller.wait(1500)
+        self.tray.hide()
+        self.app.quit()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("Nitro Control")
+    app.setQuitOnLastWindowClosed(False)
+    try:
+        app.setStyle("Fusion")
+    except Exception:
+        pass
+    app.setStyleSheet(QSS)
+    win = MainWindow(app)
+    if "--minimized" not in sys.argv:
+        win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""
+nitroctl — unified control CLI for the Acer Nitro AN517-41 on Linux.
+
+Single point of contact for all hardware interaction (battery health limit, RGB
+keyboard, sensors, capability detection). The GUI shells out to this; nothing
+else touches sysfs. Also usable directly as a scriptable interface.
+
+Privilege model:
+  * RGB device nodes are world-writable (facer default) -> no root needed.
+  * The battery `health_mode` attribute is chgrp'd to the `nitro` group with
+    mode 0664 (see `nitroctl fix-perms`, run at boot), so members of `nitro`
+    toggle it with no password prompt.
+  * /etc/nitro-control/ is group `nitro`, so preferences persist without root.
+  * Truly privileged actions (module load, perms fix at boot) run as root from
+    the installer / systemd units.
+
+Subcommands:
+  nitroctl status [--json]
+  nitroctl caps [--json]
+  nitroctl battery {on|off|toggle|status|apply-saved}
+  nitroctl kb <effect|off|list|apply-saved> [rgb-engine options...]
+  nitroctl kb set-default <effect> [options...]
+  nitroctl fan {status|auto|set <cpu> <gpu>}
+  nitroctl fix-perms          # root: re-apply group perms (boot)
+  nitroctl boot-apply         # root: fix perms + apply saved state (boot)
+  nitroctl diag
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+BAT = "/sys/class/power_supply/BAT1"
+AC = "/sys/class/power_supply/ACAD"
+HEALTH_MODE = "/sys/bus/wmi/drivers/acer-wmi-battery/health_mode"
+KB_DEV = "/dev/acer-gkbbl-0"
+NITRO_SENSE = "/sys/module/linuwu_sense"  # only present if Linuwu-Sense is installed
+PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
+
+CONFIG_DIR = Path("/etc/nitro-control")
+CONFIG_FILE = CONFIG_DIR / "config.json"
+NITRO_GROUP = "nitro"
+
+# RGB engine: installed location first, then dev checkout.
+RGB_ENGINE_CANDIDATES = [
+    "/usr/local/bin/nitro-rgb-fx",
+    "/usr/local/lib/nitro-control/nitro-rgb-fx.py",
+    str(Path(__file__).resolve().parent / "nitro-rgb-fx.py"),
+]
+
+DEFAULT_CONFIG = {
+    "battery": {"health_mode": True},
+    "keyboard": {"boot_effect": None, "color": "purple", "brightness": 100, "speed": 1.0},
+}
+
+
+# ---- small helpers -----------------------------------------------------------
+def read(path, default=None):
+    try:
+        return open(path).read().strip()
+    except Exception:
+        return default
+
+
+def read_int(path, default=None):
+    v = read(path)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def rgb_engine():
+    for c in RGB_ENGINE_CANDIDATES:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    if CONFIG_FILE.exists():
+        try:
+            user = json.loads(CONFIG_FILE.read_text())
+            for k, v in user.items():
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+        except Exception:
+            pass
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+        return True
+    except PermissionError:
+        print(f"error: cannot write {CONFIG_FILE} (need to be in '{NITRO_GROUP}' group "
+              f"or run the installer)", file=sys.stderr)
+        return False
+
+
+# ---- capability detection ----------------------------------------------------
+def caps():
+    return {
+        "battery": os.path.exists(HEALTH_MODE),
+        "keyboard": os.path.exists(KB_DEV),
+        "fans": os.path.isdir(NITRO_SENSE),          # false unless Linuwu-Sense present
+        "platform_profile": os.path.exists(PLATFORM_PROFILE),
+        "nvidia": _nvidia() is not None,
+        "cpu_temp": _cpu_temp() is not None,
+        "rgb_engine": rgb_engine() is not None,
+    }
+
+
+# ---- sensors -----------------------------------------------------------------
+def _cpu_temp():
+    import glob
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read(h + "/name") == "k10temp":
+            v = read_int(h + "/temp1_input")
+            return round(v / 1000.0, 1) if v is not None else None
+    return None
+
+
+def _amd_temp():
+    import glob
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read(h + "/name") == "amdgpu":
+            v = read_int(h + "/temp1_input")
+            return round(v / 1000.0, 1) if v is not None else None
+    return None
+
+
+def _nvidia():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,temperature.gpu,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4)
+        if out.returncode != 0:
+            return None
+        name, temp, power = [x.strip() for x in out.stdout.strip().split(",")]
+        return {"name": name, "temp_c": float(temp), "power_w": float(power)}
+    except Exception:
+        return None
+
+
+def _fan_rpm():
+    import glob
+    rpm = {}
+    for f in glob.glob("/sys/class/hwmon/hwmon*/fan*_input"):
+        v = read_int(f)
+        if v is not None:
+            rpm[os.path.basename(f)] = v
+    return rpm or None
+
+
+# ---- battery -----------------------------------------------------------------
+def battery_info():
+    hm = read_int(HEALTH_MODE)
+    ef = read_int(BAT + "/energy_full") or read_int(BAT + "/charge_full")
+    efd = read_int(BAT + "/energy_full_design") or read_int(BAT + "/charge_full_design")
+    wear = round((1 - ef / efd) * 100, 1) if ef and efd else None
+    ac = read_int(AC + "/online")
+    return {
+        "health_mode": (bool(hm) if hm is not None else None),
+        "capacity": read_int(BAT + "/capacity"),
+        "status": read(BAT + "/status"),
+        "ac_online": (bool(ac) if ac is not None else None),
+        "wear_pct": wear,
+        "energy_full": ef,
+        "energy_full_design": efd,
+    }
+
+
+def battery_set(on):
+    if not os.path.exists(HEALTH_MODE):
+        print("error: acer-wmi-battery not loaded (no health_mode)", file=sys.stderr)
+        return 2
+    try:
+        with open(HEALTH_MODE, "w") as f:
+            f.write("1" if on else "0")
+    except PermissionError:
+        # Not in the 'nitro' group yet (e.g. before re-login). Fall back to a
+        # one-off polkit/pkexec elevation so the GUI toggle still works.
+        pk = shutil.which("pkexec")
+        if os.geteuid() != 0 and not os.environ.get("NITROCTL_NO_PKEXEC") and pk:
+            rc = subprocess.call([pk, "/usr/local/bin/nitroctl", "battery", "on" if on else "off"])
+            return rc
+        print(f"error: no write access to {HEALTH_MODE}. Are you in the '{NITRO_GROUP}' "
+              f"group? (log out/in after install), or run via sudo/pkexec.", file=sys.stderr)
+        return 1
+    cfg = load_config()
+    cfg.setdefault("battery", {})["health_mode"] = bool(on)
+    save_config(cfg)
+    print(f"battery health mode: {'ON (cap ~80%)' if on else 'OFF (full charge)'}")
+    return 0
+
+
+# ---- keyboard (delegates to the RGB engine) ----------------------------------
+def kb(args):
+    eng = rgb_engine()
+    if not eng:
+        print("error: RGB engine (nitro-rgb-fx) not found", file=sys.stderr)
+        return 2
+    if not args:
+        args = ["showcase"]
+    if args[0] == "set-default":
+        return kb_set_default(args[1:])
+    if args[0] == "apply-saved":
+        return kb_apply_saved()
+    # pass straight through to the engine (list/off/<effect>/--options)
+    os.execv(sys.executable, [sys.executable, eng] + args)
+
+
+def kb_set_default(args):
+    # nitroctl kb set-default <effect> [--color X --brightness N --speed F]
+    if not args:
+        print("usage: nitroctl kb set-default <effect> [--color X --brightness N --speed F]",
+              file=sys.stderr)
+        return 2
+    cfg = load_config()
+    kbc = cfg.setdefault("keyboard", {})
+    kbc["boot_effect"] = args[0]
+    it = iter(args[1:])
+    for tok in it:
+        if tok == "--color":
+            kbc["color"] = next(it, kbc.get("color"))
+        elif tok == "--brightness":
+            kbc["brightness"] = int(next(it, kbc.get("brightness")))
+        elif tok == "--speed":
+            kbc["speed"] = float(next(it, kbc.get("speed")))
+    if save_config(cfg):
+        print(f"default keyboard effect set to '{kbc['boot_effect']}'")
+        return 0
+    return 1
+
+
+def kb_apply_saved():
+    eng = rgb_engine()
+    kbc = load_config().get("keyboard", {})
+    eff = kbc.get("boot_effect")
+    if not eff:
+        return 0  # nothing configured; leave whatever the EC holds
+    cmd = [sys.executable, eng, eff,
+           "--color", str(kbc.get("color", "purple")),
+           "--brightness", str(kbc.get("brightness", 100)),
+           "--speed", str(kbc.get("speed", 1.0))]
+    # static effects return immediately; animated ones would block, so for boot
+    # only apply static/one-shot looks here. Animated boot effects are the GUI
+    # daemon's job.
+    static = {"solid", "gradient", "gradient2", "off"}
+    if eff in static:
+        subprocess.run(cmd)
+    return 0
+
+
+# ---- fans (unsupported on this model; honest reporting) ----------------------
+def fan(args):
+    c = caps()
+    if not c["fans"]:
+        print("Fan control is NOT available on this machine.")
+        print("  No platform_profile, no mainline Nitro fan quirk, and Linuwu-Sense")
+        print("  (which could add it) conflicts with the RGB keyboard driver.")
+        print("  See FANS.md for the full explanation and a safe path forward.")
+        return 3
+    print("fan control present but not implemented by nitroctl yet; see FANS.md")
+    return 3
+
+
+# ---- privileged: perms + boot ------------------------------------------------
+def fix_perms():
+    if os.geteuid() != 0:
+        print("fix-perms must run as root", file=sys.stderr)
+        return 1
+    import grp
+    try:
+        grp.getgrnam(NITRO_GROUP)
+    except KeyError:
+        print(f"group '{NITRO_GROUP}' does not exist; run the installer first", file=sys.stderr)
+        return 1
+    import shutil
+    if os.path.exists(HEALTH_MODE):
+        shutil.chown(HEALTH_MODE, group=NITRO_GROUP)
+        os.chmod(HEALTH_MODE, 0o664)
+        print(f"fixed perms on {HEALTH_MODE}")
+    if CONFIG_DIR.exists():
+        shutil.chown(CONFIG_DIR, group=NITRO_GROUP)
+        os.chmod(CONFIG_DIR, 0o775)
+        if CONFIG_FILE.exists():
+            shutil.chown(CONFIG_FILE, group=NITRO_GROUP)
+            os.chmod(CONFIG_FILE, 0o664)
+    return 0
+
+
+def boot_apply():
+    fix_perms()
+    cfg = load_config()
+    on = cfg.get("battery", {}).get("health_mode", True)
+    if os.path.exists(HEALTH_MODE):
+        try:
+            open(HEALTH_MODE, "w").write("1" if on else "0")
+        except Exception as e:
+            print(f"boot-apply battery: {e}", file=sys.stderr)
+    kb_apply_saved()
+    return 0
+
+
+# ---- status / diag -----------------------------------------------------------
+def status():
+    return {
+        "battery": battery_info(),
+        "cpu": {"temp_c": _cpu_temp()},
+        "gpu": {"nvidia": _nvidia(), "amd_temp_c": _amd_temp()},
+        "fans": {"supported": caps()["fans"], "rpm": _fan_rpm()},
+        "keyboard": {"supported": caps()["keyboard"], "device": KB_DEV if caps()["keyboard"] else None},
+        "platform_profile": read(PLATFORM_PROFILE),
+    }
+
+
+def print_status_human(s):
+    b = s["battery"]
+    print("Battery")
+    print(f"  health limit : {'ON (~80%)' if b['health_mode'] else 'OFF' if b['health_mode'] is not None else 'n/a'}")
+    print(f"  charge       : {b['capacity']}%  ({b['status']})")
+    print(f"  AC           : {'plugged' if b['ac_online'] else 'on battery' if b['ac_online'] is not None else 'n/a'}")
+    if b["wear_pct"] is not None:
+        print(f"  wear         : {b['wear_pct']}%")
+    print("Thermals")
+    print(f"  CPU (k10temp): {s['cpu']['temp_c']} C")
+    n = s["gpu"]["nvidia"]
+    if n:
+        print(f"  GPU (nvidia) : {n['temp_c']} C, {n['power_w']} W")
+    if s["gpu"]["amd_temp_c"] is not None:
+        print(f"  iGPU (amdgpu): {s['gpu']['amd_temp_c']} C")
+    print("Fans")
+    print(f"  supported    : {s['fans']['supported']}  (see FANS.md)")
+    if s["fans"]["rpm"]:
+        print(f"  rpm          : {s['fans']['rpm']}")
+    print("Keyboard")
+    print(f"  RGB          : {'available' if s['keyboard']['supported'] else 'n/a'}")
+
+
+def diag():
+    print(f"nitroctl {VERSION}")
+    print("capabilities:", json.dumps(caps(), indent=2))
+    print("\nloaded modules:")
+    subprocess.run("lsmod | grep -Ei 'acer|facer|wmi' || true", shell=True)
+    print("\nhealth_mode perms:")
+    subprocess.run(["ls", "-l", HEALTH_MODE]) if os.path.exists(HEALTH_MODE) else print("  (absent)")
+    print("\nconfig:", CONFIG_FILE, "exists" if CONFIG_FILE.exists() else "(default)")
+    print("\nrgb engine:", rgb_engine())
+
+
+# ---- CLI ---------------------------------------------------------------------
+def main(argv):
+    if not argv:
+        print(__doc__)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    want_json = "--json" in rest
+
+    if cmd == "caps":
+        c = caps()
+        print(json.dumps(c, indent=2) if want_json else
+              "\n".join(f"{k:16s}: {v}" for k, v in c.items()))
+        return 0
+    if cmd == "status":
+        s = status()
+        if want_json:
+            print(json.dumps(s, indent=2))
+        else:
+            print_status_human(s)
+        return 0
+    if cmd == "battery":
+        sub = rest[0] if rest else "status"
+        if sub == "on":
+            return battery_set(True)
+        if sub == "off":
+            return battery_set(False)
+        if sub == "toggle":
+            cur = battery_info()["health_mode"]
+            return battery_set(not cur)
+        if sub == "apply-saved":
+            return battery_set(load_config().get("battery", {}).get("health_mode", True))
+        b = battery_info()
+        print(json.dumps(b, indent=2) if want_json else
+              f"health limit: {'ON' if b['health_mode'] else 'OFF' if b['health_mode'] is not None else 'n/a'}")
+        return 0
+    if cmd == "kb":
+        return kb(rest)
+    if cmd == "fan":
+        return fan(rest)
+    if cmd == "fix-perms":
+        return fix_perms()
+    if cmd == "boot-apply":
+        return boot_apply()
+    if cmd == "diag":
+        return diag() or 0
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    print(f"unknown command '{cmd}'. try: nitroctl help", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

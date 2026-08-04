@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""
+nitro-rgb-fx — software-driven RGB animations for the Acer Nitro AN517-41
+4-zone keyboard, on top of the `facer` kernel module.
+
+Effects are drawn frame-by-frame over /dev/acer-gkbbl-static-0. Includes custom
+animations, LIVE system effects (cpu/temp/battery), and SOUND-reactive effects.
+A persistent `daemon` mode renders from a live state file so the GUI can change
+everything smoothly, and supports an idle-timeout (off after no input, wakes on
+keypress).
+
+Usage:
+    ./nitro-rgb-fx.py <effect> [--seconds N] [--brightness 0-100] [--speed F]
+                       [--amplitude F] [--color C] [--color2 C] [--gamma G]
+    ./nitro-rgb-fx.py daemon        # persistent renderer (used by the GUI)
+    ./nitro-rgb-fx.py set --effect fire --brightness 80 --color green
+    ./nitro-rgb-fx.py showcase | list | profiles
+"""
+import argparse
+import colorsys
+import glob
+import json
+import math
+import os
+import random
+import select
+import struct
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+STATIC_DEV = "/dev/acer-gkbbl-static-0"
+DYN_DEV = "/dev/acer-gkbbl-0"
+ZONES = 4
+GAMMA = [1.0]
+PROFILE_DIR = Path.home() / ".config" / "nitro-control" / "rgb-profiles"
+STATE_FILE = Path.home() / ".config" / "nitro-control" / "rgb-state.json"
+
+COLORS = {
+    "red": "ff0000", "green": "00ff00", "blue": "0000ff", "white": "ffffff",
+    "cyan": "00ffff", "magenta": "ff00ff", "yellow": "ffff00", "orange": "ff6a00",
+    "purple": "9628ff", "violet": "7a00ff", "pink": "ff2b8f", "teal": "00ffa0",
+    "gold": "ffaa00", "lime": "aaff00", "azure": "0088ff", "warm": "ff7b1a",
+    "black": "000000", "off": "000000",
+}
+
+
+# ---- low-level device writes -------------------------------------------------
+def _write_zone(zone, r, g, b):
+    payload = bytes([1 << (zone - 1), r & 0xFF, g & 0xFF, b & 0xFF])
+    with open(STATIC_DEV, "wb") as d:
+        d.write(payload)
+
+
+def _commit(brightness):
+    payload = bytearray(16)
+    payload[2] = max(0, min(100, brightness))
+    payload[9] = 1
+    with open(DYN_DEV, "wb") as d:
+        d.write(bytes(payload))
+
+
+def _gamma(x):
+    x = max(0.0, min(255.0, x))
+    g = GAMMA[0]
+    return int(x) if g == 1.0 else int((x / 255.0) ** g * 255.0)
+
+
+def show(colors, brightness=100):
+    f = max(0, min(100, brightness)) / 100.0
+    for i, (r, g, b) in enumerate(colors, start=1):
+        _write_zone(i, _gamma(r * f), _gamma(g * f), _gamma(b * f))
+    _commit(100)
+
+
+def hsv(h, s=1.0, v=1.0):
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+    return (r * 255, g * 255, b * 255)
+
+
+def parse_color(s):
+    s = str(s).strip().lower()
+    s = COLORS.get(s, s).lstrip("#")
+    if len(s) != 6:
+        return (150, 40, 255)
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (150, 40, 255)
+
+
+def scale(c, k):
+    return (c[0] * k, c[1] * k, c[2] * k)
+
+
+def lerp(c1, c2, f):
+    return tuple(c1[i] * (1 - f) + c2[i] * f for i in range(3))
+
+
+def hue_of(rgb):
+    h, s, _ = colorsys.rgb_to_hsv(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+    return h, max(0.6, s)
+
+
+# ---- live system sampling ----------------------------------------------------
+_cpu_prev = [None]
+
+
+def cpu_load():
+    try:
+        with open("/proc/stat") as f:
+            v = list(map(int, f.readline().split()[1:]))
+    except Exception:
+        return 0.0
+    idle = v[3] + (v[4] if len(v) > 4 else 0)
+    total = sum(v)
+    prev = _cpu_prev[0]
+    _cpu_prev[0] = (total, idle)
+    if prev is None:
+        return 0.0
+    dt, di = total - prev[0], idle - prev[1]
+    return max(0.0, min(1.0, 1 - di / dt)) if dt > 0 else 0.0
+
+
+_k10 = [None]
+
+
+def cpu_temp():
+    if _k10[0] is None:
+        found = ""
+        for h in glob.glob("/sys/class/hwmon/hwmon*"):
+            try:
+                if open(h + "/name").read().strip() == "k10temp":
+                    found = h + "/temp1_input"
+                    break
+            except Exception:
+                pass
+        _k10[0] = found
+    if not _k10[0]:
+        return 50.0
+    try:
+        return int(open(_k10[0]).read()) / 1000.0
+    except Exception:
+        return 50.0
+
+
+def battery_state():
+    base = "/sys/class/power_supply/BAT1/"
+    try:
+        cap = int(open(base + "capacity").read())
+    except Exception:
+        cap = 100
+    try:
+        status = open(base + "status").read().strip()
+    except Exception:
+        status = "Unknown"
+    return cap, status
+
+
+# ---- audio level (for sound-reactive effects) --------------------------------
+class AudioLevel:
+    """Reads the default sink monitor via parec in a thread and exposes a
+    smoothed 0..1 loudness level. Degrades to 0 if audio is unavailable."""
+    _inst = None
+
+    def __init__(self):
+        self.level = 0.0
+        self.ok = False
+        self._run = True
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    @classmethod
+    def get(cls):
+        if cls._inst is None:
+            cls._inst = AudioLevel()
+        return cls._inst
+
+    def _monitor_source(self):
+        try:
+            sink = subprocess.check_output(["pactl", "get-default-sink"], text=True).strip()
+            if sink:
+                return sink + ".monitor"
+        except Exception:
+            pass
+        try:
+            out = subprocess.check_output(["pactl", "list", "short", "sources"], text=True)
+            for line in out.splitlines():
+                if "monitor" in line:
+                    return line.split()[1]
+        except Exception:
+            pass
+        return None
+
+    def _loop(self):
+        src = self._monitor_source()
+        if not src:
+            return
+        try:
+            p = subprocess.Popen(
+                ["parec", "-d", src, "--format=s16le", "--rate=22050",
+                 "--channels=1", "--latency-msec=25"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            return
+        self.ok = True
+        chunk = 1024  # samples
+        nbytes = chunk * 2
+        while self._run:
+            data = p.stdout.read(nbytes)
+            if not data or len(data) < nbytes:
+                break
+            samples = struct.unpack("<%dh" % (len(data) // 2), data)
+            rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
+            lvl = min(1.0, rms / 9000.0)          # normalise
+            # fast attack, slow release
+            self.level = max(lvl, self.level * 0.82)
+        self.ok = False
+
+
+# ---- effects: fn(t, args) -> list[4 rgb] -------------------------------------
+def _amp(a):
+    return getattr(a, "amp", 1.0)
+
+
+def fx_solid(t, a):
+    return [a.rgb] * ZONES
+
+
+def fx_gradient(t, a):
+    return [hsv(z / ZONES) for z in range(ZONES)]
+
+
+def fx_gradient2(t, a):
+    return [lerp(a.rgb, a.rgb2, z / (ZONES - 1)) for z in range(ZONES)]
+
+
+def fx_rainbow(t, a):
+    base = t * 0.15 * a.speed
+    order = list(range(ZONES)) if not a.reverse else list(reversed(range(ZONES)))
+    return [hsv(base + z / ZONES) for z in order]
+
+
+def fx_rainbow_breathe(t, a):
+    base = t * 0.15 * a.speed
+    v = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(t * 2 * a.speed))
+    return [scale(hsv(base + z / ZONES), v) for z in range(ZONES)]
+
+
+def fx_cycle(t, a):
+    return [hsv(t * 0.08 * a.speed)] * ZONES
+
+
+def fx_breathe(t, a):
+    depth = min(1.0, 0.5 * _amp(a) + 0.25)
+    v = 1 - depth + depth * (0.5 + 0.5 * math.sin(t * 2.2 * a.speed)) ** 2
+    return [scale(a.rgb, v)] * ZONES
+
+
+def fx_wave(t, a):
+    depth = min(1.0, 0.5 * _amp(a))
+    return [scale(a.rgb, (1 - depth) + depth * (0.5 + 0.5 * math.sin(t * 2 * a.speed - z * 1.4)))
+            for z in range(ZONES)]
+
+
+def fx_comet(t, a):
+    pos = (math.sin(t * 1.6 * a.speed) * 0.5 + 0.5) * (ZONES - 1)
+    return [scale(a.rgb, max(0.0, 1.0 - abs(z - pos) / 1.4)) for z in range(ZONES)]
+
+
+def fx_scanner(t, a):
+    pos = (math.sin(t * 2.0 * a.speed) * 0.5 + 0.5) * (ZONES - 1)
+    return [scale(a.rgb, max(0.0, 1.0 - abs(z - pos) / 0.9)) for z in range(ZONES)]
+
+
+def fx_meteor(t, a):
+    head = (t * a.speed * 1.2) % (ZONES + 1.5)
+    return [scale(a.rgb, max(0.0, 1.0 - (head - z) / 1.6)) if head >= z else (0, 0, 0)
+            for z in range(ZONES)]
+
+
+def fx_chase(t, a):
+    pos = int(t * a.speed * 3) % ZONES
+    pos = (ZONES - 1 - pos) if a.reverse else pos
+    return [a.rgb if z == pos else scale(a.rgb, 0.05) for z in range(ZONES)]
+
+
+def fx_fire(t, a):
+    h, s = hue_of(a.rgb if a.color_set else (255, 90, 0))
+    amp = _amp(a)
+    return [hsv(h + (random.random() - 0.5) * 0.05,
+                s, max(0.06, 1.0 - amp * 0.85 * random.random())) for _ in range(ZONES)]
+
+
+_candle = [[0.7] * ZONES]
+
+
+def fx_candle(t, a):
+    h, s = hue_of(a.rgb if a.color_set else (255, 80, 0))
+    amp = _amp(a)
+    out = []
+    for z in range(ZONES):
+        target = max(0.08, 1.0 - amp * 0.8 * random.random())
+        _candle[0][z] += (target - _candle[0][z]) * 0.22
+        out.append(hsv(h, s, _candle[0][z]))
+    return out
+
+
+def fx_police(t, a):
+    on = int(t * 6 * a.speed) % 2 == 0
+    return [(255, 0, 0) if on else (0, 0, 0)] * 2 + [(0, 0, 255) if not on else (0, 0, 0)] * 2
+
+
+def fx_strobe(t, a):
+    return [a.rgb if int(t * 8 * a.speed) % 2 == 0 else (0, 0, 0)] * ZONES
+
+
+def fx_ocean(t, a):
+    ch, cs = (hue_of(a.rgb) if a.color_set else (0.55, 0.9))
+    out = []
+    for z in range(ZONES):
+        h = ch + 0.06 * math.sin(t * 0.6 * a.speed + z)
+        v = 0.45 + 0.35 * math.sin(t * 0.9 * a.speed + z * 1.7)
+        out.append(hsv(h, cs, max(0.1, v)))
+    return out
+
+
+def fx_aurora(t, a):
+    ch = hue_of(a.rgb)[0] if a.color_set else 0.4
+    rng = 0.12 if a.color_set else 0.25
+    out = []
+    for z in range(ZONES):
+        h = ch + rng * math.sin(t * 0.5 * a.speed + z * 0.9)
+        v = 0.4 + 0.5 * (0.5 + 0.5 * math.sin(t * 0.8 + z * 2.1))
+        out.append(hsv(h, 0.85, v))
+    return out
+
+
+def fx_plasma(t, a):
+    ch = hue_of(a.rgb)[0] if a.color_set else 0.5
+    rng = 0.12 if a.color_set else 0.5
+    out = []
+    for z in range(ZONES):
+        v = math.sin(z * 1.3 + t * a.speed) + math.sin(t * a.speed * 0.7 + z)
+        out.append(hsv(ch + rng * (v / 4) + t * 0.03 * a.speed, 0.9, 1.0))
+    return out
+
+
+def fx_vaporwave(t, a):
+    c1 = a.rgb if a.color_set else (255, 60, 180)
+    c2 = a.rgb2 if a.color_set else (0, 220, 255)
+    return [lerp(c1, c2, 0.5 + 0.5 * math.sin(t * a.speed + z * 1.2)) for z in range(ZONES)]
+
+
+def fx_pulse(t, a):
+    beat = 0.5 + 0.5 * math.sin(t * 3.0 * a.speed)
+    return [hsv((t * 0.1 * a.speed) % 1.0, 1.0, beat * beat)] * ZONES
+
+
+def fx_heartbeat(t, a):
+    x = (t * a.speed) % 1.4
+    v = 0.1 + 0.9 * max(max(0.0, 1 - abs(x - 0.1) / 0.09), max(0.0, 1 - abs(x - 0.32) / 0.09))
+    return [scale(a.rgb, v)] * ZONES
+
+
+def fx_twinkle(t, a):
+    out = [scale(a.rgb, 0.15) for _ in range(ZONES)]
+    if random.random() < 0.3 * _amp(a):
+        out[random.randrange(ZONES)] = (255, 255, 255)
+    return out
+
+
+def fx_lightning(t, a):
+    r = random.random()
+    if r < 0.05:
+        return [(255, 255, 255)] * ZONES
+    if r < 0.15:
+        o = [(0, 0, 18)] * ZONES
+        o[random.randrange(ZONES)] = (200, 200, 255)
+        return o
+    return [(0, 0, 18)] * ZONES
+
+
+def fx_matrix(t, a):
+    h, s = hue_of(a.rgb if a.color_set else (0, 255, 60))
+    return [hsv(h, s, random.random() ** 2) for _ in range(ZONES)]
+
+
+def fx_holiday(t, a):
+    shift = int(t * a.speed * 1.5) % 2
+    return [(255, 0, 0) if (z + shift) % 2 == 0 else (0, 120, 0) for z in range(ZONES)]
+
+
+_disco = [-1, [(0, 0, 0)] * ZONES]
+
+
+def fx_disco(t, a):
+    beat = int(t * a.speed * 4)
+    if beat != _disco[0]:
+        _disco[0] = beat
+        _disco[1] = [hsv(random.random(), 1.0, 1.0) for _ in range(ZONES)]
+    return _disco[1]
+
+
+def fx_sunrise(t, a):
+    p = ((t * a.speed) % 12) / 12
+    stops = [(0.0, (0, 0, 0)), (0.25, (60, 0, 0)), (0.5, (255, 40, 0)),
+             (0.75, (255, 160, 0)), (1.0, (255, 255, 220))]
+    for i in range(len(stops) - 1):
+        p0, c0 = stops[i]
+        p1, c1 = stops[i + 1]
+        if p0 <= p <= p1:
+            return [lerp(c0, c1, (p - p0) / (p1 - p0))] * ZONES
+    return [(255, 255, 220)] * ZONES
+
+
+def fx_sos(t, a):
+    pattern = [1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0]
+    unit = 0.18 / max(0.1, a.speed)
+    on = pattern[int(t / unit) % len(pattern)] == 1
+    return [a.rgb if on else (0, 0, 0)] * ZONES
+
+
+def fx_cpu(t, a):
+    lit = cpu_load() * ZONES
+    return [hsv(0.33 * (1 - z / (ZONES - 1)), 1.0, max(0.03, min(1.0, lit - z))) for z in range(ZONES)]
+
+
+def fx_temp(t, a):
+    frac = max(0.0, min(1.0, (cpu_temp() - 40) / (85 - 40)))
+    return [hsv(0.66 * (1 - frac), 1.0, max(0.25, 0.4 + 0.6 * frac))] * ZONES
+
+
+def fx_battery(t, a):
+    cap, status = battery_state()
+    lit = cap / 100 * ZONES
+    charging = status in ("Charging", "Full")
+    hue = 0.33 if charging or cap > 40 else (0.0 if cap <= 20 else 0.12)
+    out = [hsv(hue, 1.0, max(0.03, min(1.0, lit - z))) for z in range(ZONES)]
+    if charging:
+        out = [scale(c, 0.6 + 0.4 * math.sin(t * 3)) for c in out]
+    return out
+
+
+def fx_sound(t, a):
+    """Sound bar: zones fill left->right with loudness over a dim base.
+    Colour = custom (--color) or shifts green->red as it gets louder."""
+    lvl = AudioLevel.get().level
+    lit = lvl * ZONES
+    out = []
+    for z in range(ZONES):
+        k = max(0.0, min(1.0, lit - z))
+        if a.color_set:
+            col = a.rgb
+        else:
+            col = hsv(0.33 * (1 - z / (ZONES - 1)))  # green..red
+        base = scale(col, 0.06)
+        out.append(lerp(base, col, k))
+    return out
+
+
+def fx_soundwave(t, a):
+    """Sound pulse: keyboard dark, all zones light up by loudness with a little
+    per-zone shimmer. Colour = custom, or cycles hue over time."""
+    lvl = AudioLevel.get().level
+    col = a.rgb if a.color_set else hsv(t * 0.1)
+    return [scale(col, max(0.0, min(1.0, lvl * (0.7 + 0.5 * math.sin(t * 6 + z))))) for z in range(ZONES)]
+
+
+EFFECTS = {
+    "solid": (fx_solid, "Solid custom colour (--color)"),
+    "gradient": (fx_gradient, "Static rainbow spread"),
+    "gradient2": (fx_gradient2, "Static blend --color -> --color2"),
+    "rainbow": (fx_rainbow, "Rolling rainbow (--reverse to flip)"),
+    "rainbowbreathe": (fx_rainbow_breathe, "Rolling rainbow that also breathes"),
+    "cycle": (fx_cycle, "Whole board slowly cycles the hue wheel"),
+    "breathe": (fx_breathe, "Breathing in any colour (--color)"),
+    "wave": (fx_wave, "Brightness wave sweeping the zones (--color)"),
+    "comet": (fx_comet, "Head sweeps back and forth, fading tail (--color)"),
+    "scanner": (fx_scanner, "Sharper KITT-style bounce (--color)"),
+    "meteor": (fx_meteor, "Meteor with a trail (--color)"),
+    "chase": (fx_chase, "Single lit zone marches along (--color)"),
+    "fire": (fx_fire, "Flickering flames (colourable, --amplitude)"),
+    "candle": (fx_candle, "Candle flicker (colourable, --amplitude)"),
+    "police": (fx_police, "Red/blue strobe"),
+    "strobe": (fx_strobe, "Hard on/off strobe (--color)"),
+    "ocean": (fx_ocean, "Drifting blues/teals (tintable --color)"),
+    "aurora": (fx_aurora, "Northern lights (tintable --color)"),
+    "plasma": (fx_plasma, "Flowing plasma (tintable --color)"),
+    "vaporwave": (fx_vaporwave, "Two-colour drift (--color/--color2)"),
+    "pulse": (fx_pulse, "Whole-board hue pulses to a beat"),
+    "heartbeat": (fx_heartbeat, "Double-thump heartbeat (--color)"),
+    "twinkle": (fx_twinkle, "Random white sparkles (--color/--amplitude)"),
+    "lightning": (fx_lightning, "Dark sky with lightning flashes"),
+    "matrix": (fx_matrix, "Digital-rain flicker (tintable --color)"),
+    "holiday": (fx_holiday, "Alternating red/green marquee"),
+    "disco": (fx_disco, "Random colours to a beat"),
+    "sunrise": (fx_sunrise, "Slow sunrise"),
+    "sos": (fx_sos, "Blinks S-O-S in Morse (--color)"),
+    "sound": (fx_sound, "SOUND: VU bar reacting to system audio (--color)"),
+    "soundwave": (fx_soundwave, "SOUND: dark board pulsing with audio (--color)"),
+    "cpu": (fx_cpu, "LIVE: CPU load meter"),
+    "temp": (fx_temp, "LIVE: CPU temperature"),
+    "battery": (fx_battery, "LIVE: battery charge meter"),
+    "off": (lambda t, a: [(0, 0, 0)] * ZONES, "All zones off"),
+}
+
+STATIC_EFFECTS = {"solid", "gradient", "gradient2", "off"}
+PROFILE_KEYS = ("effect", "seconds", "brightness", "speed", "amplitude", "fps",
+                "color", "color2", "reverse", "gamma")
+
+
+def run_effect(name, a, seconds, fps=None):
+    fn = EFFECTS[name][0]
+    if name in STATIC_EFFECTS:
+        show(fn(0, a), a.brightness)
+        return
+    dt = 1.0 / (fps or a.fps)
+    t0 = time.monotonic()
+    deadline = t0 + seconds if seconds else None
+    while True:
+        show(fn(time.monotonic() - t0, a), a.brightness)
+        if deadline and time.monotonic() >= deadline:
+            return
+        time.sleep(dt)
+
+
+# ---- idle input monitor (for daemon idle-off / wake-on-keypress) -------------
+class IdleMonitor:
+    def __init__(self):
+        self.fds = []
+        for path in glob.glob("/dev/input/event*"):
+            try:
+                self.fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
+            except Exception:
+                pass
+        self.ok = bool(self.fds)
+        self.last = time.monotonic()
+
+    def poll(self):
+        if not self.ok:
+            return
+        r, _, _ = select.select(self.fds, [], [], 0)
+        if r:
+            for fd in r:
+                try:
+                    while os.read(fd, 4096):
+                        pass
+                except Exception:
+                    pass
+            self.last = time.monotonic()
+
+    def idle_for(self):
+        return time.monotonic() - self.last
+
+
+# ---- state + daemon ----------------------------------------------------------
+def read_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"effect": "gradient", "brightness": 100, "speed": 1.0, "color": None}
+
+
+def write_state(**kw):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    st = read_state()
+    st.update(kw)
+    STATE_FILE.write_text(json.dumps(st, indent=2))
+    return st
+
+
+def _state_to_args(st):
+    a = argparse.Namespace()
+    a.speed = float(st.get("speed", 1.0))
+    a.amp = float(st.get("amplitude", 1.0))
+    a.fps = float(st.get("fps", 18))
+    a.brightness = int(st.get("brightness", 100))
+    a.reverse = bool(st.get("reverse", False))
+    a.gamma = float(st.get("gamma", 1.0))
+    col = st.get("color")
+    a.color_set = bool(col)
+    a.rgb = parse_color(col) if a.color_set else parse_color("purple")
+    c2 = st.get("color2")
+    a.rgb2 = parse_color(c2) if c2 else parse_color("cyan")
+    return a
+
+
+def daemon():
+    idle = IdleMonitor()
+    t0 = time.monotonic()
+    last_static = None
+    off_frame = [(0, 0, 0)] * ZONES
+    while True:
+        st = read_state()
+        a = _state_to_args(st)
+        GAMMA[0] = a.gamma
+        eff = st.get("effect", "gradient")
+        idle_off = float(st.get("idle_off", 0) or 0)
+
+        idle.poll()
+        # Idle-off only when we can actually detect input; otherwise stay on.
+        idled = idle.ok and idle_off > 0 and idle.idle_for() > idle_off and eff != "off"
+
+        fn = EFFECTS.get(eff, EFFECTS["gradient"])[0]
+        t = time.monotonic() - t0
+        if idled:
+            if last_static != "idled":
+                show(off_frame, a.brightness)
+                last_static = "idled"
+            time.sleep(0.1)
+        elif eff in STATIC_EFFECTS:
+            key = json.dumps(st, sort_keys=True)
+            if key != last_static:
+                show(fn(t, a), a.brightness)
+                last_static = key
+            time.sleep(0.12)
+        else:
+            last_static = None
+            show(fn(t, a), a.brightness)
+            time.sleep(1.0 / max(1.0, a.fps))
+
+
+# ---- profiles ----------------------------------------------------------------
+def save_profile(name, a):
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {k: getattr(a, k, None) for k in PROFILE_KEYS}
+    (PROFILE_DIR / f"{name}.json").write_text(json.dumps(data, indent=2))
+    print(f"saved profile '{name}'")
+
+
+def load_profile(name, a):
+    f = PROFILE_DIR / f"{name}.json"
+    if not f.exists():
+        print(f"no such profile '{name}'")
+        sys.exit(1)
+    data = json.loads(f.read_text())
+    for k in PROFILE_KEYS:
+        if k in data:
+            setattr(a, k, data[k])
+    return a
+
+
+def showcase(a):
+    seq = [("rainbow", 5, None), ("plasma", 5, None), ("meteor", 4, "gold"),
+           ("aurora", 5, None), ("candle", 4, "orange"), ("vaporwave", 4, None),
+           ("heartbeat", 4, "red"), ("disco", 3, None), ("ocean", 4, None)]
+    for name, dur, col in seq:
+        print(f"  -> {name} ({dur}s)")
+        a.color_set = bool(col)
+        if col:
+            a.rgb = parse_color(col)
+        run_effect(name, a, dur)
+    run_effect("gradient", a, 0)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Custom + live + sound RGB effects for the Nitro keyboard.")
+    p.add_argument("effect", nargs="?", default="showcase")
+    p.add_argument("--seconds", type=float, default=0)
+    p.add_argument("--brightness", type=int, default=100)
+    p.add_argument("--speed", type=float, default=1.0)
+    p.add_argument("--amplitude", type=float, default=1.0, help="effect intensity/depth")
+    p.add_argument("--fps", type=float, default=18)
+    p.add_argument("--color", default=None)
+    p.add_argument("--color2", default=None)
+    p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--reverse", action="store_true")
+    p.add_argument("--save")
+    p.add_argument("--load")
+    p.add_argument("--effect", dest="set_effect")
+    a = p.parse_args()
+
+    if a.load:
+        a = load_profile(a.load, a)
+    a.color_set = a.color is not None
+    a.rgb = parse_color(a.color) if a.color_set else parse_color("purple")
+    a.rgb2 = parse_color(a.color2) if a.color2 else parse_color("cyan")
+    a.amp = a.amplitude
+    GAMMA[0] = a.gamma
+
+    if a.effect == "daemon":
+        try:
+            daemon()
+        except KeyboardInterrupt:
+            pass
+        return
+    if a.effect == "set":
+        kw = {"brightness": a.brightness, "speed": a.speed, "amplitude": a.amplitude,
+              "fps": a.fps, "gamma": a.gamma, "reverse": a.reverse, "color": a.color}
+        if a.set_effect:
+            kw["effect"] = a.set_effect
+        if a.color2:
+            kw["color2"] = a.color2
+        write_state(**kw)
+        return
+    if a.effect == "list":
+        for k, (_, desc) in EFFECTS.items():
+            print(f"  {k:15s} {desc}")
+        return
+    if a.effect == "profiles":
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        for f in sorted(PROFILE_DIR.glob("*.json")):
+            print(" ", f.stem)
+        return
+    if a.save:
+        save_profile(a.save, a)
+    try:
+        if a.effect == "showcase":
+            showcase(a)
+        elif a.effect in EFFECTS:
+            run_effect(a.effect, a, a.seconds)
+        else:
+            print(f"unknown effect '{a.effect}'")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

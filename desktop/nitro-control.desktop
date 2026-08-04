@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nitro Control
+GenericName=Acer Nitro Control
+Comment=Battery limit, RGB keyboard and system controls for Acer Nitro
+Exec=/usr/local/bin/nitro-control-gui
+Icon=nitro-control
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=acer;nitro;rgb;keyboard;battery;fan;nitrosense;
+StartupNotify=false

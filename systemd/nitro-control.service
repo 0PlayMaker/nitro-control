@@ -1,0 +1,13 @@
+[Unit]
+Description=Nitro control: fix perms, apply saved battery/keyboard state
+Documentation=https://github.com/0PlayMaker/nitro-control
+After=systemd-modules-load.service multi-user.target suspend.target hibernate.target
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/nitroctl boot-apply
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Nitro Control (tray)
+Comment=Start Nitro Control minimised to the system tray
+Exec=/usr/local/bin/nitro-control-gui --minimized
+Icon=nitro-control
+Terminal=false
+Categories=System;
+X-KDE-autostart-after=panel
+NoDisplay=true

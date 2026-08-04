@@ -1,0 +1,4 @@
+# Best-effort: when the acer-wmi-battery driver binds, hand the health_mode
+# attribute to the 'nitro' group so members toggle it without a password.
+# The nitro-control.service boot unit is the deterministic fallback.
+ACTION=="bind", SUBSYSTEM=="wmi", RUN+="/usr/local/bin/nitroctl fix-perms"
