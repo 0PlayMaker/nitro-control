@@ -680,7 +680,7 @@ PROFILE_KEYS = ("effect", "seconds", "brightness", "speed", "amplitude", "fps",
 STATE_KEYS = ("effect", "brightness", "speed", "amplitude", "color", "color2",
               "idle_off", "zone_colors", "bass_gain", "spec_gain", "bass_zone",
               "vu_reverse", "vu_source", "spec_reverse", "glow", "snd_smooth",
-              "snd_gate", "snd_adapt", "fps", "gamma", "reverse")
+              "snd_gate", "snd_adapt", "fps", "gamma", "reverse", "wake_source")
 
 
 def run_effect(name, a, seconds, fps=None):
@@ -713,29 +713,62 @@ class IdleMonitor:
 
     So the device set is refreshed whenever /dev/input changes (one cheap stat,
     not a re-glob), and only nodes that actually report keys/motion are opened.
+
+    `keys_only` (the default) restricts that set to real keyboards, so moving
+    the touchpad doesn't light the keyboard up — this is a keyboard backlight,
+    and it should follow typing, not the pointer.
     """
     EV_KEY, EV_REL, EV_ABS = 0x2, 0x4, 0x8   # bit N of the EV mask = event type N
     SCAN_THROTTLE = 1.0
+    # A real keyboard reports ~100 codes in the main block; a touchpad or mouse
+    # reports none there (their buttons are BTN_* at 0x100 and up) and a power
+    # button or hotkey node only a handful.
+    TYPING_KEYS_MIN = 20
 
-    def __init__(self):
+    def __init__(self, keys_only=True):
         self.fds = {}                 # path -> fd
         self.ok = False
         self.last = time.monotonic()
+        self.keys_only = bool(keys_only)
         self._dir_mtime = None
         self._next_scan = 0.0
         self._scan(force=True)
 
+    def set_keys_only(self, keys_only):
+        """Switch wake sources at runtime, when the setting changes."""
+        keys_only = bool(keys_only)
+        if keys_only != self.keys_only:
+            self.keys_only = keys_only
+            self._scan(force=True)
+
+    @staticmethod
+    def _typing_keys(spec):
+        """How many key codes below 128 a device can emit.
+
+        /proc/bus/input/devices prints the KEY bitmap as 64-bit groups, most
+        significant first, so the last two cover codes 0..127 — which are all
+        real keys. Buttons (BTN_LEFT, BTN_TOOL_FINGER, ...) start at 0x100 and
+        land in earlier groups, so a pointer scores zero here.
+        """
+        n = 0
+        for tok in spec.split()[-2:]:
+            try:
+                n += bin(int(tok, 16)).count("1")
+            except ValueError:
+                pass
+        return n
+
     @classmethod
-    def _wanted(cls):
-        """Event nodes that report keys, pointer motion or touch — skipping
-        jack-sense, lid and PC-speaker nodes that never signal user presence."""
+    def _wanted(cls, keys_only=True):
+        """Event nodes worth watching — skipping jack-sense, lid and PC-speaker
+        nodes that never signal user presence."""
         try:
             text = open("/proc/bus/input/devices").read()
         except Exception:
             return set(glob.glob("/dev/input/event*"))
         want, care = set(), cls.EV_KEY | cls.EV_REL | cls.EV_ABS
         for block in text.split("\n\n"):
-            node, ev = None, 0
+            node, ev, keys = None, 0, 0
             for line in block.splitlines():
                 if line.startswith("H: Handlers"):
                     for tok in line.split("=", 1)[-1].split():
@@ -746,9 +779,20 @@ class IdleMonitor:
                         ev = int(line.split("=", 1)[-1], 16)
                     except ValueError:
                         ev = 0
-            if node and ev & care:
+                elif line.startswith("B: KEY="):
+                    keys = cls._typing_keys(line.split("=", 1)[-1])
+            if not node:
+                continue
+            if keys_only:
+                if ev & cls.EV_KEY and keys >= cls.TYPING_KEYS_MIN:
+                    want.add(node)
+            elif ev & care:
                 want.add(node)
-        return want or set(glob.glob("/dev/input/event*"))
+        if want:
+            return want
+        # No keyboard recognised (odd firmware, unreadable proc): fall back to
+        # watching everything rather than never waking at all.
+        return cls._wanted(False) if keys_only else set(glob.glob("/dev/input/event*"))
 
     def _scan(self, force=False):
         now = time.monotonic()
@@ -762,7 +806,7 @@ class IdleMonitor:
         if not force and mtime == self._dir_mtime:
             return                     # nothing added or removed since last look
         self._dir_mtime = mtime
-        want = self._wanted()
+        want = self._wanted(self.keys_only)
         for path in [p for p in self.fds if p not in want]:
             try:
                 os.close(self.fds.pop(path))
@@ -914,7 +958,7 @@ FADE_IN = 0.35          # seconds: swell back up on the first keypress
 
 
 def daemon():
-    idle = IdleMonitor()
+    idle = IdleMonitor(keys_only=True)
     t0 = time.monotonic()
     last_static = None
     last_frame = [(0, 0, 0)] * ZONES
@@ -926,6 +970,7 @@ def daemon():
         GAMMA[0] = a.gamma
         eff = st.get("effect", "gradient")
         idle_off = float(st.get("idle_off", 0) or 0)
+        idle.set_keys_only(str(st.get("wake_source", "keyboard")) != "any")
 
         idle.poll()
         # Idle-off only when we can actually detect input; otherwise stay on.
@@ -1037,6 +1082,10 @@ def main():
                    help="sound effects: noise gate, 0-1 (default 0.13)")
     p.add_argument("--adapt", dest="snd_adapt", type=float, default=0.5,
                    help="sound effects: auto-level, 0 = quick, 1 = steady (default 0.5)")
+    p.add_argument("--wake-source", dest="wake_source", choices=("keyboard", "any"),
+                   default=None,
+                   help="what wakes the lights from idle-off: keyboard (default) "
+                        "or any input including the touchpad")
     p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--reverse", action="store_true")
     p.add_argument("--save")
@@ -1073,6 +1122,8 @@ def main():
             kw["color2"] = a.color2
         if a.zone_colors is not None:
             kw["zone_colors"] = a.zone_colors or None
+        if a.wake_source:
+            kw["wake_source"] = a.wake_source
         write_state(**kw)
         return
     if a.effect == "presets":

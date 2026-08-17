@@ -25,7 +25,9 @@ reboots, suspend and kernel updates** — the thing that actually matters.
   noise gate, auto-levelling, resting glow, bar direction and meter source.
 - 📊 **Live effects** that map CPU load, temperature and battery to the keyboard.
 - 🎨 Per-effect custom colours, per-zone colours, brightness, speed, **intensity**,
-  and an **idle-timeout** (lights fade out after inactivity, swell back on a keypress).
+  and an **idle-timeout** (lights fade out after inactivity, swell back on a
+  keypress). Waking is **keyboard-only by default** — the touchpad won't light
+  the keyboard up — switchable to keyboard + touchpad.
 - 💾 **User presets** — save any tuned look (a modified candle, your own
   sound-reactive setup) by name, re-apply or delete it from the GUI or CLI.
 - 🌙 **Firmware backlight blanking disabled.** The Acer EC blanks the keyboard 30 s
@@ -113,6 +115,7 @@ nitroctl kb ec-timeout 0     # firmware backlight blanking off (0-255 s)
 nitro-rgb-fx list            # list effects
 nitro-rgb-fx candle --color green --amplitude 2   # green, dramatic candle
 nitro-rgb-fx zones --zone-colors red,gold,green,blue
+nitro-rgb-fx set --wake-source any    # let the touchpad wake the lights too
 ```
 
 **Sound-reactive** — `sound` (4-band spectrum), `soundbass` (bass + VU meter),

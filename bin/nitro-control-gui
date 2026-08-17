@@ -442,10 +442,17 @@ class MainWindow(QMainWindow):
         self.autooff.setCurrentIndex(self.autooff.count() - 1)  # default: Never
         self.autooff.currentIndexChanged.connect(lambda *_: self.schedule_apply())
         sg.addWidget(self.autooff, 3, 1)
-        hint = QLabel("Counts from your last keypress or mouse move, and fades\n"
-                      "back up the moment you touch either.")
-        hint.setObjectName("muted")
-        sg.addWidget(hint, 4, 1, 1, 2)
+        sg.addWidget(QLabel("Wake on"), 4, 0)
+        self.wakesrc = QComboBox()
+        self.wakesrc.addItem("Keyboard only", "keyboard")
+        self.wakesrc.addItem("Keyboard + touchpad", "any")
+        self.wakesrc.currentIndexChanged.connect(lambda *_: self.schedule_apply())
+        sg.addWidget(self.wakesrc, 4, 1)
+        self.autooff_hint = QLabel()
+        self.autooff_hint.setObjectName("muted")
+        sg.addWidget(self.autooff_hint, 5, 1, 1, 2)
+        self.wakesrc.currentIndexChanged.connect(lambda *_: self._sync_wake_hint())
+        self._sync_wake_hint()
         panel.addWidget(sbox)
         panel.addWidget(self._sound_box())
 
@@ -702,7 +709,8 @@ class MainWindow(QMainWindow):
         for combo, key, default in ((self.basszone, "bass_zone", 4),
                                     (self.vudir, "vu_reverse", False),
                                     (self.vusrc, "vu_source", "full"),
-                                    (self.specdir, "spec_reverse", False)):
+                                    (self.specdir, "spec_reverse", False),
+                                    (self.wakesrc, "wake_source", "keyboard")):
             val = st.get(key, default)
             for i in range(combo.count()):
                 if combo.itemData(i) == val:
@@ -718,6 +726,18 @@ class MainWindow(QMainWindow):
         self._paint_labels()
         self._update_off_btn()
         self._sync_effect_ui()
+        self._sync_wake_hint()
+
+    def _sync_wake_hint(self):
+        """Keep the idle hint honest about what actually wakes the lights."""
+        if self.wakesrc.currentData() == "any":
+            self.autooff_hint.setText(
+                "Counts from your last keypress or touchpad move, and fades\n"
+                "back up the moment you touch either.")
+        else:
+            self.autooff_hint.setText(
+                "Counts from your last keypress, and fades back up when you\n"
+                "type. The touchpad won't wake it.")
 
     def _slider_map(self):
         """(widget, state key, units-per-slider-step) for every slider."""
@@ -756,6 +776,7 @@ class MainWindow(QMainWindow):
             "effect": effect if effect is not None else self.current_key(),
             "color": (None if self.auto_color else self.color),
             "idle_off": int(self.autooff.currentData() or 0),
+            "wake_source": self.wakesrc.currentData() or "keyboard",
             "zone_colors": (",".join(c or "" for c in self.zone_colors)
                             if any(self.zone_colors) else None),
             "bass_zone": int(self.basszone.currentData() or 4),
