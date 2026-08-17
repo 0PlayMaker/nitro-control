@@ -5,3 +5,11 @@ __pycache__/
 *.ko
 *.ko.xz
 .DS_Store
+
+# out-of-tree kbuild leftovers (kernel/)
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/

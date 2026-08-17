@@ -43,6 +43,18 @@ for p in $(ps -C python3 -o pid=,args= 2>/dev/null | grep -E 'nitro-control-gui|
   kill "$p" 2>/dev/null || true
 done
 
+# 3a. EC backlight timeout: hand blanking back to the firmware before unloading,
+#     otherwise the machine is left with no idle blanking at all.
+rm -f /etc/modules-load.d/nitro-kbd-timeout.conf
+[ -w /sys/kernel/nitro_kbd/backlight_timeout ] && \
+  echo 30 > /sys/kernel/nitro_kbd/backlight_timeout 2>/dev/null || true
+if command -v dkms >/dev/null && dkms status nitro-kbd-timeout/1.0 2>/dev/null | grep -q nitro-kbd; then
+  dkms remove -m nitro-kbd-timeout -v 1.0 --all 2>/dev/null || true
+  log "removed nitro-kbd-timeout DKMS module"
+fi
+rm -rf /usr/src/nitro-kbd-timeout-1.0
+rmmod nitro_kbd_timeout 2>/dev/null || true
+
 # 3. RGB: unload facer, remove DKMS, restore acer_wmi
 rm -f /etc/modprobe.d/facer.conf /etc/modules-load.d/facer.conf
 if command -v dkms >/dev/null && dkms status facer/"$FACER_VER" 2>/dev/null | grep -q facer; then

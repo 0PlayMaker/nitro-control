@@ -21,6 +21,7 @@ Subcommands:
   nitroctl battery {on|off|toggle|status|apply-saved}
   nitroctl kb <effect|off|list|apply-saved> [rgb-engine options...]
   nitroctl kb set-default <effect> [options...]
+  nitroctl kb ec-timeout [0-255]   # firmware backlight blanking; 0 = off
   nitroctl fan {status|auto|set <cpu> <gpu>}
   nitroctl fix-perms          # root: re-apply group perms (boot)
   nitroctl boot-apply         # root: fix perms + apply saved state (boot)
@@ -39,6 +40,10 @@ BAT = "/sys/class/power_supply/BAT1"
 AC = "/sys/class/power_supply/ACAD"
 HEALTH_MODE = "/sys/bus/wmi/drivers/acer-wmi-battery/health_mode"
 KB_DEV = "/dev/acer-gkbbl-0"
+# The EC's own backlight idle timeout, exposed by our nitro_kbd_timeout module.
+# The firmware defaults to 30 s and resets on every boot, so it has to be
+# re-applied; 0 hands idle behaviour entirely to nitro-control's own timer.
+KB_EC_TIMEOUT = "/sys/kernel/nitro_kbd/backlight_timeout"
 NITRO_SENSE = "/sys/module/linuwu_sense"  # only present if Linuwu-Sense is installed
 PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
 
@@ -55,7 +60,8 @@ RGB_ENGINE_CANDIDATES = [
 
 DEFAULT_CONFIG = {
     "battery": {"health_mode": True},
-    "keyboard": {"boot_effect": None, "color": "purple", "brightness": 100, "speed": 1.0},
+    "keyboard": {"boot_effect": None, "color": "purple", "brightness": 100, "speed": 1.0,
+                 "ec_timeout": 0},
 }
 
 
@@ -218,6 +224,8 @@ def kb(args):
         return kb_set_default(args[1:])
     if args[0] == "apply-saved":
         return kb_apply_saved()
+    if args[0] == "ec-timeout":
+        return kb_ec_timeout(args[1:])
     # pass straight through to the engine (list/off/<effect>/--options)
     os.execv(sys.executable, [sys.executable, eng] + args)
 
@@ -243,6 +251,46 @@ def kb_set_default(args):
         print(f"default keyboard effect set to '{kbc['boot_effect']}'")
         return 0
     return 1
+
+
+def kb_ec_timeout(args):
+    # nitroctl kb ec-timeout            -> print the EC's current timeout
+    # nitroctl kb ec-timeout <seconds>  -> set it (0 = off) and remember it
+    if not os.path.exists(KB_EC_TIMEOUT):
+        print("EC backlight timeout not available (nitro_kbd_timeout module not loaded)",
+              file=sys.stderr)
+        return 2
+    if not args:
+        cur = read(KB_EC_TIMEOUT)
+        print(f"EC backlight timeout: {'off' if cur == '0' else cur + ' s'}")
+        return 0
+    try:
+        secs = int(args[0])
+        if not 0 <= secs <= 255:
+            raise ValueError
+    except ValueError:
+        print("usage: nitroctl kb ec-timeout [0-255]   (0 = off)", file=sys.stderr)
+        return 2
+    if not _write_ec_timeout(secs):
+        pk = shutil.which("pkexec")
+        if os.geteuid() != 0 and not os.environ.get("NITROCTL_NO_PKEXEC") and pk:
+            return subprocess.call([pk, "/usr/local/bin/nitroctl", "kb", "ec-timeout", str(secs)])
+        print(f"error: no write access to {KB_EC_TIMEOUT}; run via sudo/pkexec",
+              file=sys.stderr)
+        return 1
+    cfg = load_config()
+    cfg.setdefault("keyboard", {})["ec_timeout"] = secs
+    save_config(cfg)
+    print(f"EC backlight timeout: {'off' if secs == 0 else str(secs) + ' s'}")
+    return 0
+
+
+def _write_ec_timeout(secs):
+    try:
+        open(KB_EC_TIMEOUT, "w").write(str(int(secs)))
+        return True
+    except Exception:
+        return False
 
 
 def kb_apply_saved():
@@ -311,6 +359,12 @@ def boot_apply():
             open(HEALTH_MODE, "w").write("1" if on else "0")
         except Exception as e:
             print(f"boot-apply battery: {e}", file=sys.stderr)
+    # The EC forgets this across a power cycle and comes up at 30 s, so it has
+    # to be re-asserted here — this runs on boot and again on resume.
+    if os.path.exists(KB_EC_TIMEOUT):
+        secs = cfg.get("keyboard", {}).get("ec_timeout", 0)
+        if not _write_ec_timeout(secs):
+            print(f"boot-apply: could not write {KB_EC_TIMEOUT}", file=sys.stderr)
     kb_apply_saved()
     return 0
 
@@ -322,7 +376,9 @@ def status():
         "cpu": {"temp_c": _cpu_temp()},
         "gpu": {"nvidia": _nvidia(), "amd_temp_c": _amd_temp()},
         "fans": {"supported": caps()["fans"], "rpm": _fan_rpm()},
-        "keyboard": {"supported": caps()["keyboard"], "device": KB_DEV if caps()["keyboard"] else None},
+        "keyboard": {"supported": caps()["keyboard"],
+                     "device": KB_DEV if caps()["keyboard"] else None,
+                     "ec_timeout": read(KB_EC_TIMEOUT)},
         "platform_profile": read(PLATFORM_PROFILE),
     }
 
@@ -348,6 +404,8 @@ def print_status_human(s):
         print(f"  rpm          : {s['fans']['rpm']}")
     print("Keyboard")
     print(f"  RGB          : {'available' if s['keyboard']['supported'] else 'n/a'}")
+    ect = s["keyboard"].get("ec_timeout")
+    print(f"  EC blanking  : {'off' if ect == '0' else ect + ' s' if ect else 'n/a'}")
 
 
 def diag():

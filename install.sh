@@ -21,6 +21,8 @@ LOG="/var/log/nitro-control-install.log"
 EXPECTED_MODEL="Nitro AN517-41"
 FACER_REPO="https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module.git"
 FACER_VER="0.2"
+KBT_NAME="nitro-kbd-timeout"
+KBT_VER="1.0"
 COPR="asan/acer-modules"
 GROUP="nitro"
 HEALTH_MODE="/sys/bus/wmi/drivers/acer-wmi-battery/health_mode"
@@ -185,6 +187,41 @@ EOF
     modprobe facer 2>/dev/null || true
   fi
   add_installed "facer boot wiring (blacklist acer_wmi + modules-load)"
+  install_kbd_timeout
+}
+
+# ---------- ec backlight timeout (our own small module, via DKMS) ----------
+# The EC blanks the keyboard backlight 30 s after the last keypress and ignores
+# everything written over WMI, which makes nitro-control's own idle timer look
+# broken. facer does not expose the setting; this module does. The firmware
+# forgets it on every power cycle, so nitroctl boot-apply re-asserts it.
+install_kbd_timeout() {
+  info "== ec backlight timeout =="
+  if dkms status "$KBT_NAME/$KBT_VER" 2>/dev/null | grep -q installed; then
+    add_skipped "$KBT_NAME DKMS module (already installed)"
+  else
+    run mkdir -p "/usr/src/$KBT_NAME-$KBT_VER/src"
+    run install -m 0644 "$REPO/kernel/dkms.conf" "$REPO/kernel/Makefile" \
+        "/usr/src/$KBT_NAME-$KBT_VER/"
+    run install -m 0644 "$REPO/kernel/src/nitro_kbd_timeout.c" \
+        "/usr/src/$KBT_NAME-$KBT_VER/src/"
+    run dkms add -m "$KBT_NAME" -v "$KBT_VER"
+    run dkms build -m "$KBT_NAME" -v "$KBT_VER"
+    run dkms install -m "$KBT_NAME" -v "$KBT_VER"
+    add_installed "$KBT_NAME module (DKMS $KBT_VER)"
+  fi
+  run install -m 0644 "$REPO/kernel/modules-load.d/nitro-kbd-timeout.conf" \
+      /etc/modules-load.d/nitro-kbd-timeout.conf
+  if [ "$CHECK" -eq 0 ]; then
+    modprobe nitro_kbd_timeout 2>/dev/null || true
+    if [ -w /sys/kernel/nitro_kbd/backlight_timeout ]; then
+      echo 0 > /sys/kernel/nitro_kbd/backlight_timeout
+      NOTES+=("firmware backlight blanking disabled — the idle timer in nitro-control now owns it")
+    else
+      warn "nitro_kbd_timeout did not load; firmware will keep blanking at 30 s"
+    fi
+  fi
+  add_installed "ec backlight timeout wiring"
 }
 
 # ---------- gui ----------

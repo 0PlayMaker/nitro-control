@@ -1,7 +1,7 @@
 # Nitro Control
 
 A **NitroSense replacement for Linux** — battery charge limiting, full 4-zone RGB
-keyboard control with 30+ effects, and a native Qt tray app — for the **Acer Nitro
+keyboard control with 35+ effects, and a native Qt tray app — for the **Acer Nitro
 AN517-41** (and close siblings) on Fedora / KDE Plasma.
 
 Acer's control software is Windows-only. If you run Linux you lose the battery
@@ -17,13 +17,21 @@ reboots, suspend and kernel updates** — the thing that actually matters.
 
 - 🔋 **Battery charge limit (80%)** that persists across cold boots, suspend/resume
   and kernel updates (re-asserted automatically — never silently resets again).
-- ⌨️ **4-zone RGB keyboard** with **30+ software effects**: rainbow, plasma, aurora,
+- ⌨️ **4-zone RGB keyboard** with **35+ software effects**: rainbow, plasma, aurora,
   ocean, fire, candle, comet, meteor, breathe, wave, twinkle, lightning, matrix,
   vaporwave, police, heartbeat, disco, sunrise, and more.
-- 🎵 **Sound-reactive** effects (VU bar + pulse) that react to system audio.
+- 🎵 **Sound-reactive** effects — a 4-band **spectrum analyser**, a **bass + VU
+  meter**, and a whole-keyboard **pulse** — with live controls for smoothing,
+  noise gate, auto-levelling, resting glow, bar direction and meter source.
 - 📊 **Live effects** that map CPU load, temperature and battery to the keyboard.
-- 🎨 Per-effect custom colours, brightness, speed, **intensity**, and an
-  **idle-timeout** (lights off after inactivity, wake on keypress).
+- 🎨 Per-effect custom colours, per-zone colours, brightness, speed, **intensity**,
+  and an **idle-timeout** (lights fade out after inactivity, swell back on a keypress).
+- 💾 **User presets** — save any tuned look (a modified candle, your own
+  sound-reactive setup) by name, re-apply or delete it from the GUI or CLI.
+- 🌙 **Firmware backlight blanking disabled.** The Acer EC blanks the keyboard 30 s
+  after the last keypress and ignores anything written over WMI — which makes
+  *any* Linux idle-timeout setting look broken. A small kernel module turns it off
+  so the idle timer here is the one that decides. See [How it works](#how-it-works).
 - 🖥️ A **capability-driven Qt GUI** with a **system-tray** icon, live dashboard
   (CPU/GPU temps, battery, wear), and one-click controls — hides features your
   machine doesn't support instead of showing dead buttons.
@@ -55,13 +63,22 @@ Verified on: AN517-41, BIOS V1.08, Fedora 44, kernel 7.1.x, Ryzen 7 5800H + RTX 
 - **RGB**: the [`facer`](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module)
   kernel module (installed via DKMS), driven by a small persistent daemon that
   renders effects frame-by-frame over `/dev/acer-gkbbl-static-0`.
+- **Backlight blanking**: `nitro_kbd_timeout`, a ~190-line module in
+  [`kernel/`](kernel/), also via DKMS. The EC keeps its backlight idle timeout in
+  a 48-bit word behind WMI GUID `61EF69EA-…`, laid out as
+  `[47:40 timeout secs][39:32 aux][31:0 subcommand]`. It exposes it at
+  `/sys/kernel/nitro_kbd/backlight_timeout` (seconds, `0` = off). The setting
+  lives in EC RAM and resets to 30 s on every power cycle — which is why toggling
+  it in Windows NitroSense does **not** carry over to Linux — so
+  `nitroctl boot-apply` re-asserts it at boot and on resume. Writes preserve the
+  neighbouring `aux` field rather than blanking the whole word.
 
 ---
 
 ## Install
 
 ```bash
-git clone https://github.com/PlayMaker/nitro-control.git
+git clone https://github.com/0PlayMaker/nitro-control.git
 cd nitro-control
 sudo ./install.sh          # battery + RGB + GUI (default)
 ```
@@ -90,12 +107,38 @@ plus the exact rollback command.
 
 **CLI:**
 ```bash
-nitroctl status              # temps, battery, wear, capabilities
+nitroctl status              # temps, battery, wear, capabilities, EC blanking
 nitroctl battery on|off      # 80% charge limit
+nitroctl kb ec-timeout 0     # firmware backlight blanking off (0-255 s)
 nitro-rgb-fx list            # list effects
 nitro-rgb-fx candle --color green --amplitude 2   # green, dramatic candle
-nitro-rgb-fx sound           # react to system audio
+nitro-rgb-fx zones --zone-colors red,gold,green,blue
 ```
+
+**Sound-reactive** — `sound` (4-band spectrum), `soundbass` (bass + VU meter),
+`soundwave` (whole-keyboard pulse):
+
+```bash
+nitro-rgb-fx sound --spec-reverse --gate 0.15 --smoothing 0.6
+nitro-rgb-fx soundbass --bass-zone 4 --vu-source nobass --bass-gain 1.2
+nitro-rgb-fx soundwave --glow 0.1 --adapt 0.5
+```
+
+`--gate` ignores room noise, `--smoothing` sets how slowly bars fall back,
+`--adapt` is how fast auto-levelling tracks a change in volume, and `--glow`
+keeps unlit zones dimly on instead of fully black.
+
+**Presets** — save any tuned look and bring it back:
+
+```bash
+nitro-rgb-fx save-preset "movie night"   # snapshot the current settings
+nitro-rgb-fx presets                     # list saved presets
+nitro-rgb-fx preset "movie night"        # apply one
+nitro-rgb-fx del-preset "movie night"
+```
+
+In the GUI, **Apply** commits the current look as the one that comes back after a
+reboot; **My presets** saves and deletes named looks.
 
 ## Uninstall
 
@@ -114,9 +157,13 @@ huge thanks to their authors:
 - **facer** — 4-zone RGB — by [JafarAkhondali](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module) (GPL-2.0)
 - **acer-wmi-battery** — charge limit — by [frederik-h](https://github.com/frederik-h/acer-wmi-battery) (GPL-2.0)
 - **asan/acer-modules** Copr — packaging of the battery akmod
+- **[Linuwu-Sense](https://github.com/0x7375646F/Linuwu-Sense)** — where the
+  backlight-timeout WMI call was documented; `kernel/nitro_kbd_timeout.c` is an
+  independent, much smaller implementation, but it would not exist without it.
 
 These modules are fetched at install time, not bundled; they keep their own
 licenses. Nitro Control's own code (`nitroctl`, `nitro-rgb-fx`, the GUI, installer)
-is released under the **MIT License** — see [LICENSE](LICENSE).
+is released under the **MIT License** — see [LICENSE](LICENSE). The one exception
+is `kernel/nitro_kbd_timeout.c`, which is **GPL-2.0** as a Linux kernel module.
 
 Made by **PlayMaker**.

@@ -1,4 +1,12 @@
 {
-  "battery": {"health_mode": true},
-  "keyboard": {"boot_effect": null, "color": "purple", "brightness": 100, "speed": 1.0}
+  "battery": {
+    "health_mode": true
+  },
+  "keyboard": {
+    "boot_effect": null,
+    "color": "purple",
+    "brightness": 100,
+    "speed": 1.0,
+    "ec_timeout": 0
+  }
 }
