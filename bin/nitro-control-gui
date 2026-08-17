@@ -19,13 +19,16 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QGridLayout, QTabWidget, QCheckBox, QSlider, QColorDialog,
     QGroupBox, QSystemTrayIcon, QMenu, QMessageBox, QFrame, QListWidget,
-    QListWidgetItem, QComboBox, QProgressBar,
+    QListWidgetItem, QComboBox, QProgressBar, QInputDialog, QScrollArea,
 )
 
 NITROCTL = "nitroctl"
 RGB = "nitro-rgb-fx"
-STATE_FILE = Path.home() / ".config" / "nitro-control" / "rgb-state.json"
-DAEMON_PID = Path.home() / ".config" / "nitro-control" / "rgb-daemon.pid"
+CONF_DIR = Path.home() / ".config" / "nitro-control"
+STATE_FILE = CONF_DIR / "rgb-state.json"
+DEFAULT_FILE = CONF_DIR / "rgb-default.json"
+PRESET_DIR = CONF_DIR / "presets"
+DAEMON_PID = CONF_DIR / "rgb-daemon.pid"
 ACCENT = "#8a2be2"
 ACCENT2 = "#00e5ff"
 GREEN = "#3ad07a"
@@ -46,7 +49,10 @@ EFFECTS = [
     ("🪩  Disco", "disco"), ("🎄  Holiday", "holiday"),
     ("🌅  Sunrise", "sunrise"), ("🆘  SOS", "sos"),
     ("⬛  Solid", "solid"), ("🎚️  Gradient", "gradient"),
-    ("🔊  Sound bar", "sound"), ("🔊  Sound pulse", "soundwave"),
+    ("🎨  Zones (per-zone colours)", "zones"),
+    ("🔊  Sound bar (spectrum)", "sound"),
+    ("🔊  Sound bass + VU", "soundbass"),
+    ("🔊  Sound pulse", "soundwave"),
     ("📊  CPU meter", "cpu"), ("🌡️  Temp meter", "temp"),
     ("🔋  Battery meter", "battery"),
 ]
@@ -94,7 +100,7 @@ QSlider::sub-page:horizontal {{ background: qlineargradient(x1:0 y1:0 x2:1 y2:0,
 QSlider::handle:horizontal {{ width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; background: white; }}
 QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 5px; border: 1px solid #3a3f4c; background: #23262f; }}
 QCheckBox::indicator:checked {{ background: {GREEN}; border-color: {GREEN}; }}
-QComboBox {{ background: #23262f; border: 1px solid #333846; border-radius: 7px; padding: 6px 10px; min-width: 120px; }}
+QComboBox {{ background: #23262f; border: 1px solid #333846; border-radius: 7px; padding: 6px 10px; min-width: 100px; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{ background: #1c1f27; border: 1px solid #2b2f3a; outline: none;
                                selection-background-color: {ACCENT}; padding: 4px; }}
@@ -104,6 +110,27 @@ QLabel#h1 {{ font-size: 17px; font-weight: 700; }}
 QLabel#muted {{ color: #8b91a0; }}
 QLabel#stattitle {{ color: #8b91a0; font-size: 11px; letter-spacing: 1px; }}
 """
+
+
+def write_json(path, data):
+    """Atomic write — the RGB daemon polls these files and must never read a
+    half-written one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def preset_file(name):
+    safe = "".join(c for c in str(name) if c.isalnum() or c in " _-").strip()
+    return PRESET_DIR / f"{safe or 'preset'}.json"
 
 
 def nitroctl(*args, timeout=8):
@@ -244,13 +271,14 @@ class MainWindow(QMainWindow):
         self.caps = caps()
         self.color = "#9628ff"
         self.auto_color = True
+        self.zone_colors = [None] * 4      # per-zone overrides, left -> right
         self._last_effect = "gradient"
         self._is_off = False
         self.daemon_proc = None
 
         self.setWindowTitle("Nitro Control")
         self.setWindowIcon(make_icon())
-        self.resize(720, 600)
+        self.resize(980, 820)
 
         self._apply_timer = QTimer(self); self._apply_timer.setSingleShot(True)
         self._apply_timer.timeout.connect(self.apply)
@@ -269,6 +297,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(tabs)
         self.setCentralWidget(central)
 
+        if self.caps.get("keyboard"):
+            self._load_state()   # reflect the saved look instead of clobbering it
         self._make_tray()
         self._ensure_daemon()
         self.poller = Poller()
@@ -346,10 +376,13 @@ class MainWindow(QMainWindow):
             it = QListWidgetItem(label); it.setData(Qt.UserRole, key)
             self.eff_list.addItem(it)
         self.eff_list.setCurrentRow(2)  # plasma
-        self.eff_list.currentItemChanged.connect(lambda *_: self.schedule_apply())
-        root.addWidget(self.eff_list, 3)
+        self.eff_list.setMaximumWidth(285)
+        self.eff_list.currentItemChanged.connect(
+            lambda *_: (self._sync_effect_ui(), self.schedule_apply()))
+        root.addWidget(self.eff_list, 0)
 
         panel = QVBoxLayout(); panel.setSpacing(12)
+        panel.addWidget(self._preset_box())
 
         cbox = QGroupBox("Colour theme")
         cl = QVBoxLayout(cbox)
@@ -368,8 +401,23 @@ class MainWindow(QMainWindow):
         row.addWidget(custom); row.addWidget(self.auto_chk); row.addStretch()
         row.addWidget(QLabel("Now:")); row.addWidget(self.color_preview)
         cl.addLayout(row)
+
+        zrow = QHBoxLayout()
+        zl = QLabel("Per-zone"); zl.setObjectName("muted")
+        zrow.addWidget(zl); zrow.addSpacing(6)
+        self.zone_btns = []
+        for z in range(4):
+            b = QPushButton(str(z + 1)); b.setFixedSize(32, 27)
+            b.setToolTip(f"Zone {z + 1} colour  (zone 1 = far left, 4 = far right)")
+            b.clicked.connect(lambda _=False, i=z: self.pick_zone_color(i))
+            self.zone_btns.append(b); zrow.addWidget(b)
+        zreset = QPushButton("Reset"); zreset.setToolTip("Back to the effect's own colours")
+        zreset.clicked.connect(self.clear_zone_colors)
+        zrow.addSpacing(6); zrow.addWidget(zreset); zrow.addStretch()
+        cl.addLayout(zrow)
         panel.addWidget(cbox)
         self._paint_preview()
+        self._paint_zone_btns()
 
         sbox = QGroupBox("Adjust"); sg = QGridLayout(sbox); sg.setVerticalSpacing(14)
         sg.addWidget(QLabel("Brightness"), 0, 0)
@@ -394,16 +442,130 @@ class MainWindow(QMainWindow):
         self.autooff.setCurrentIndex(self.autooff.count() - 1)  # default: Never
         self.autooff.currentIndexChanged.connect(lambda *_: self.schedule_apply())
         sg.addWidget(self.autooff, 3, 1)
+        hint = QLabel("Counts from your last keypress or mouse move, and fades\n"
+                      "back up the moment you touch either.")
+        hint.setObjectName("muted")
+        sg.addWidget(hint, 4, 1, 1, 2)
         panel.addWidget(sbox)
+        panel.addWidget(self._sound_box())
 
         brow = QHBoxLayout()
         self.offbtn = QPushButton("Turn off"); self.offbtn.clicked.connect(self.toggle_off)
-        setb = QPushButton("Set as boot default"); setb.setObjectName("accent")
-        setb.clicked.connect(self.set_default_effect)
-        brow.addWidget(self.offbtn); brow.addStretch(); brow.addWidget(setb)
+        self.applybtn = QPushButton("Apply"); self.applybtn.setObjectName("accent")
+        self.applybtn.setMinimumWidth(120)
+        self.applybtn.setToolTip("Save everything on this tab as your default — "
+                                 "it comes back after a reboot or re-login")
+        self.applybtn.clicked.connect(self.save_default)
+        brow.addWidget(self.offbtn); brow.addStretch(); brow.addWidget(self.applybtn)
         panel.addLayout(brow); panel.addStretch()
-        root.addLayout(panel, 4)
+
+        # The panel is taller than most windows, so let it scroll rather than
+        # clip the buttons off the bottom.
+        holder = QWidget(); holder.setLayout(panel)
+        scroll = QScrollArea(); scroll.setWidget(holder)
+        scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        root.addWidget(scroll, 1)
+        self._refresh_presets()
+        self._sync_effect_ui()
         return w
+
+    def _preset_box(self):
+        box = QGroupBox("My presets")
+        lay = QVBoxLayout(box)
+        row = QHBoxLayout()
+        self.preset_combo = QComboBox()
+        self.preset_combo.setToolTip("A preset stores this whole tab: effect, colours, "
+                                     "brightness, idle timer and every sound setting")
+        self.preset_combo.currentIndexChanged.connect(self.on_preset_pick)
+        psave = QPushButton("Save…"); psave.setToolTip("Save the current look as a preset")
+        psave.clicked.connect(self.save_preset)
+        self.pdel = QPushButton("Delete"); self.pdel.setEnabled(False)
+        self.pdel.clicked.connect(self.delete_preset)
+        row.addWidget(self.preset_combo, 1); row.addWidget(psave); row.addWidget(self.pdel)
+        lay.addLayout(row)
+        return box
+
+    def _snd_row(self, grid, r, key, text, widget, tail=None, tip=None):
+        lab = QLabel(text)
+        if tip:
+            lab.setToolTip(tip); widget.setToolTip(tip)
+        grid.addWidget(lab, r, 0); grid.addWidget(widget, r, 1)
+        row = [lab, widget]
+        if tail is not None:
+            grid.addWidget(tail, r, 2); row.append(tail)
+        self._snd_rows[key] = row
+        return widget
+
+    def _snd_slider(self, lo, hi, val):
+        s = QSlider(Qt.Horizontal); s.setRange(lo, hi); s.setValue(val)
+        s.valueChanged.connect(lambda *_: self.schedule_apply())
+        return s
+
+    @staticmethod
+    def _tail():
+        l = QLabel(""); l.setObjectName("muted"); l.setFixedWidth(58)
+        return l
+
+    def _sound_box(self):
+        self.sndbox = QGroupBox("Sound reactive")
+        self._snd_rows = {}
+        g = QGridLayout(self.sndbox); g.setVerticalSpacing(12)
+
+        self.bassg = self._snd_row(g, 0, "bass", "Bass", self._snd_slider(1, 40, 10),
+                                   self._tail(), "How hard the bass drives the lights")
+        self.bassg_lbl = self._snd_rows["bass"][2]
+        self.specg = self._snd_row(g, 1, "spec", "Spectrum", self._snd_slider(1, 40, 10),
+                                   self._tail(),
+                                   "How hard the mids, treble and overall volume drive them")
+        self.specg_lbl = self._snd_rows["spec"][2]
+        self.smooth = self._snd_row(g, 2, "smooth", "Smoothing", self._snd_slider(0, 100, 57),
+                                    self._tail(),
+                                    "Low = snappy and twitchy, high = flows with the music")
+        self.gate = self._snd_row(g, 3, "gate", "Noise gate", self._snd_slider(0, 100, 13),
+                                  self._tail(),
+                                  "Ignore quiet room noise so the zones rest properly in silence")
+        self.adapt = self._snd_row(g, 4, "adapt", "Auto-level", self._snd_slider(0, 100, 50),
+                                   self._tail(),
+                                   "Low = re-levels fast so quiet tracks still fill the zones, "
+                                   "high = holds a steady reference so loud and quiet look different")
+        self.glow = self._snd_row(g, 5, "glow", "Resting glow", self._snd_slider(0, 50, 8),
+                                  self._tail(),
+                                  "What the keyboard sits at when nothing is playing — "
+                                  "0 % looks exactly like the lights being off")
+
+        self.specdir = QComboBox()
+        self.specdir.addItem("Bass on the left", False)
+        self.specdir.addItem("Bass on the right", True)
+        self.specdir.currentIndexChanged.connect(lambda *_: self.schedule_apply())
+        self._snd_row(g, 6, "specdir", "Bar direction", self.specdir, None,
+                      "Which end of the keyboard the low frequencies sit on")
+
+        self.basszone = QComboBox()
+        for z in range(1, 5):
+            edge = "  (far left)" if z == 1 else "  (far right)" if z == 4 else ""
+            self.basszone.addItem(f"Zone {z}{edge}", z)
+        self.basszone.setCurrentIndex(3)                 # zone 4 = far right
+        self.basszone.currentIndexChanged.connect(lambda *_: self.schedule_apply())
+        self._snd_row(g, 7, "basszone", "Bass zone", self.basszone, None,
+                      "Which zone is the dedicated bass meter")
+
+        self.vudir = QComboBox()
+        self.vudir.addItem("From zone 1 outwards", False)
+        self.vudir.addItem("From the far end back", True)
+        self.vudir.currentIndexChanged.connect(lambda *_: self.schedule_apply())
+        self._snd_row(g, 8, "vudir", "Meter fills", self.vudir, None,
+                      "Direction the volume meter climbs as it gets louder")
+
+        self.vusrc = QComboBox()
+        self.vusrc.addItem("Whole mix", "full")
+        self.vusrc.addItem("Mids + treble only", "nobass")
+        self.vusrc.addItem("Bass only", "bass")
+        self.vusrc.currentIndexChanged.connect(lambda *_: self.schedule_apply())
+        self._snd_row(g, 9, "vusrc", "Meter reads", self.vusrc, None,
+                      "What the volume meter listens to. 'Mids + treble' keeps it "
+                      "independent of the dedicated bass zone")
+        return self.sndbox
 
     # ---- Fans / About ----
     def _fans_tab(self):
@@ -494,35 +656,187 @@ class MainWindow(QMainWindow):
             self.daemon_proc = None
         self.apply()
 
+    def _load_state(self):
+        """Restore the look you left. The live state wins; the Apply-saved
+        default is the fallback for a first run or a wiped state file."""
+        st = read_json(STATE_FILE) or read_json(DEFAULT_FILE)
+        if st:
+            self._apply_state(st)
+
+    def _apply_state(self, st):
+        """Push a saved state dict into every control. Signals are blocked
+        throughout so this never triggers a premature apply()."""
+        eff = st.get("effect")
+        if eff:
+            for i in range(self.eff_list.count()):
+                if self.eff_list.item(i).data(Qt.UserRole) == eff:
+                    self.eff_list.blockSignals(True)
+                    self.eff_list.setCurrentRow(i)
+                    self.eff_list.blockSignals(False)
+                    break
+            if eff != "off":
+                self._last_effect = eff
+            self._is_off = (eff == "off")
+        for widget, key, mult in self._slider_map():
+            val = st.get(key)
+            if isinstance(val, (int, float)):
+                widget.blockSignals(True)
+                widget.setValue(int(round(val * mult)))
+                widget.blockSignals(False)
+        col = st.get("color")
+        self.auto_color = not col
+        if col:
+            self.color = col
+        self.auto_chk.blockSignals(True)
+        self.auto_chk.setChecked(self.auto_color)
+        self.auto_chk.blockSignals(False)
+        self._paint_preview()
+        io = st.get("idle_off")
+        if io is not None:
+            for i in range(self.autooff.count()):
+                if int(self.autooff.itemData(i)) == int(io):
+                    self.autooff.blockSignals(True)
+                    self.autooff.setCurrentIndex(i)
+                    self.autooff.blockSignals(False)
+                    break
+        for combo, key, default in ((self.basszone, "bass_zone", 4),
+                                    (self.vudir, "vu_reverse", False),
+                                    (self.vusrc, "vu_source", "full"),
+                                    (self.specdir, "spec_reverse", False)):
+            val = st.get(key, default)
+            for i in range(combo.count()):
+                if combo.itemData(i) == val:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(i)
+                    combo.blockSignals(False)
+                    break
+        zc = st.get("zone_colors")
+        parts = zc.split(",") if zc else []
+        self.zone_colors = [(parts[i].strip() or None) if i < len(parts) else None
+                            for i in range(4)]
+        self._paint_zone_btns()
+        self._paint_labels()
+        self._update_off_btn()
+        self._sync_effect_ui()
+
+    def _slider_map(self):
+        """(widget, state key, units-per-slider-step) for every slider."""
+        return ((self.bright, "brightness", 1),
+                (self.speed, "speed", 10),
+                (self.amp, "amplitude", 10),
+                (self.bassg, "bass_gain", 10),
+                (self.specg, "spec_gain", 10),
+                (self.smooth, "snd_smooth", 100),
+                (self.gate, "snd_gate", 100),
+                (self.adapt, "snd_adapt", 100),
+                (self.glow, "glow", 100))
+
     def current_key(self):
         it = self.eff_list.currentItem() if hasattr(self, "eff_list") else None
         return it.data(Qt.UserRole) if it else "gradient"
 
-    def schedule_apply(self):
+    def _paint_labels(self):
         self.bright_lbl.setText(f"{self.bright.value()}%")
         self.speed_lbl.setText(f"{self.speed.value() / 10:.1f}×")
         self.amp_lbl.setText(f"{self.amp.value() / 10:.1f}×")
+        self.bassg_lbl.setText(f"{self.bassg.value() / 10:.1f}×")
+        self.specg_lbl.setText(f"{self.specg.value() / 10:.1f}×")
+        for key, widget in (("smooth", self.smooth), ("gate", self.gate),
+                            ("adapt", self.adapt), ("glow", self.glow)):
+            self._snd_rows[key][2].setText(f"{widget.value()}%")
+
+    def schedule_apply(self):
+        self._paint_labels()
         self._apply_timer.start(60)
 
-    def apply(self, effect=None):
-        eff = effect if effect is not None else self.current_key()
-        state = {
-            "effect": eff,
-            "brightness": self.bright.value(),
-            "speed": round(self.speed.value() / 10.0, 2),
-            "amplitude": round(self.amp.value() / 10.0, 2),
+    def _state_dict(self, effect=None):
+        """The complete look — one definition shared by the live state, presets
+        and the saved default, so nothing can be captured by one but not another."""
+        st = {
+            "effect": effect if effect is not None else self.current_key(),
             "color": (None if self.auto_color else self.color),
             "idle_off": int(self.autooff.currentData() or 0),
+            "zone_colors": (",".join(c or "" for c in self.zone_colors)
+                            if any(self.zone_colors) else None),
+            "bass_zone": int(self.basszone.currentData() or 4),
+            "vu_reverse": bool(self.vudir.currentData()),
+            "vu_source": self.vusrc.currentData() or "full",
+            "spec_reverse": bool(self.specdir.currentData()),
         }
+        for widget, key, mult in self._slider_map():
+            st[key] = widget.value() if mult == 1 else round(widget.value() / mult, 3)
+        return st
+
+    def apply(self, effect=None):
+        state = self._state_dict(effect)
+        eff = state["effect"]
         try:
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            STATE_FILE.write_text(json.dumps(state))
+            write_json(STATE_FILE, state)
         except Exception:
             pass
         if eff != "off":
             self._last_effect = eff
         self._is_off = (eff == "off")
         self._update_off_btn()
+
+    # ---- presets ----
+    def _refresh_presets(self, select=None):
+        try:
+            names = sorted(f.stem for f in PRESET_DIR.glob("*.json"))
+        except Exception:
+            names = []
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("Presets…" if names else "No presets yet", None)
+        for n in names:
+            self.preset_combo.addItem(n, n)
+        if select and select in names:
+            self.preset_combo.setCurrentIndex(names.index(select) + 1)
+        self.preset_combo.blockSignals(False)
+        self.pdel.setEnabled(bool(self.preset_combo.currentData()))
+
+    def on_preset_pick(self, *_):
+        name = self.preset_combo.currentData()
+        self.pdel.setEnabled(bool(name))
+        if not name:
+            return
+        st = read_json(preset_file(name))
+        if st is None:
+            QMessageBox.warning(self, "Presets", f"Could not read preset '{name}'.")
+            return
+        self._apply_state(st)
+        self.apply()
+
+    def save_preset(self):
+        cur = self.preset_combo.currentData() or ""
+        name, ok = QInputDialog.getText(self, "Save preset", "Name this look:", text=cur)
+        name = name.strip()
+        if not ok or not name:
+            return
+        path = preset_file(name)
+        if path.exists() and QMessageBox.question(
+                self, "Save preset", f"'{name}' already exists. Replace it?") != QMessageBox.Yes:
+            return
+        try:
+            write_json(path, self._state_dict())
+        except Exception as e:
+            QMessageBox.warning(self, "Presets", f"Could not save: {e}")
+            return
+        self._refresh_presets(select=path.stem)
+        self.tray.showMessage("Nitro Control", f"Preset '{path.stem}' saved", make_icon(), 2500)
+
+    def delete_preset(self):
+        name = self.preset_combo.currentData()
+        if not name:
+            return
+        if QMessageBox.question(self, "Delete preset",
+                                f"Delete the preset '{name}'?") != QMessageBox.Yes:
+            return
+        try:
+            preset_file(name).unlink(missing_ok=True)
+        except Exception:
+            pass
+        self._refresh_presets()
 
     def toggle_off(self):
         if self._is_off:
@@ -547,6 +861,53 @@ class MainWindow(QMainWindow):
         if c.isValid():
             self.set_color(c.name())
 
+    def pick_zone_color(self, idx):
+        cur = self.zone_colors[idx] or self.color
+        c = QColorDialog.getColor(QColor(cur), self, f"Zone {idx + 1} colour")
+        if c.isValid():
+            self.zone_colors[idx] = c.name()
+            self._paint_zone_btns()
+            self.schedule_apply()
+
+    def clear_zone_colors(self):
+        self.zone_colors = [None] * 4
+        self._paint_zone_btns()
+        self.schedule_apply()
+
+    def _paint_zone_btns(self):
+        for i, b in enumerate(self.zone_btns):
+            c = self.zone_colors[i]
+            if c:
+                b.setStyleSheet(f"background:{c}; color:#000; font-weight:700;"
+                                "border:1px solid #333846; border-radius:6px;")
+            else:
+                b.setStyleSheet("")
+
+    # Which sound controls each preset actually listens to. Rows that would do
+    # nothing are hidden rather than greyed, so the panel only ever shows knobs
+    # that will change what you see.
+    SOUND_ROWS = {
+        "sound": ("bass", "spec", "smooth", "gate", "adapt", "glow", "specdir"),
+        "soundbass": ("bass", "spec", "smooth", "gate", "adapt", "glow",
+                      "basszone", "vudir", "vusrc"),
+        "soundwave": ("bass", "spec", "smooth", "gate", "adapt", "glow"),
+    }
+
+    def _sync_effect_ui(self):
+        """Only offer the controls the selected effect actually listens to."""
+        eff = self.current_key()
+        is_sound = eff in self.SOUND_ROWS
+        self.sndbox.setEnabled(is_sound)
+        self.sndbox.setTitle("Sound reactive" if is_sound
+                             else "Sound reactive  ·  pick a 🔊 effect")
+        shown = self.SOUND_ROWS.get(eff, self.SOUND_ROWS["soundwave"])
+        for key, widgets in self._snd_rows.items():
+            for wdg in widgets:
+                wdg.setVisible(key in shown)
+        per_zone = eff in ("sound", "soundbass", "zones")
+        for b in self.zone_btns:
+            b.setEnabled(per_zone)
+
     def on_auto_toggle(self, v):
         self.auto_color = v
         self._paint_preview()
@@ -561,13 +922,25 @@ class MainWindow(QMainWindow):
             self.color_preview.setStyleSheet(
                 f"border-radius:7px; border:1px solid #333846; background:{self.color};")
 
-    def set_default_effect(self):
-        args = ["kb", "set-default", self._last_effect,
-                "--brightness", str(self.bright.value()), "--speed", str(self.speed.value() / 10.0)]
-        if not self.auto_color:
-            args += ["--color", self.color]
+    def save_default(self):
+        """Apply: commit the current look everywhere it needs to live to survive
+        a reboot — the live state the daemon renders, the user-level default the
+        GUI falls back to, and the system config the boot service applies before
+        the desktop is even up."""
+        self.apply()
+        st = self._state_dict()
+        try:
+            write_json(DEFAULT_FILE, st)
+        except Exception:
+            pass
+        args = ["kb", "set-default", st["effect"] if st["effect"] != "off" else self._last_effect,
+                "--brightness", str(st["brightness"]), "--speed", str(st["speed"])]
+        if st.get("color"):
+            args += ["--color", st["color"]]
         nitroctl(*args)
-        self.tray.showMessage("Nitro Control", f"Boot default set to '{self._last_effect}'",
+        self.applybtn.setText("✓  Saved")
+        QTimer.singleShot(1600, lambda: self.applybtn.setText("Apply"))
+        self.tray.showMessage("Nitro Control", "Saved — this look comes back after a reboot",
                               make_icon(), 3000)
 
     # ---- battery ----

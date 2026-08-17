@@ -14,7 +14,8 @@ Usage:
                        [--amplitude F] [--color C] [--color2 C] [--gamma G]
     ./nitro-rgb-fx.py daemon        # persistent renderer (used by the GUI)
     ./nitro-rgb-fx.py set --effect fire --brightness 80 --color green
-    ./nitro-rgb-fx.py showcase | list | profiles
+    ./nitro-rgb-fx.py preset "My mix" | save-preset "My mix" | del-preset "My mix"
+    ./nitro-rgb-fx.py showcase | list | profiles | presets
 """
 import argparse
 import colorsys
@@ -36,7 +37,9 @@ DYN_DEV = "/dev/acer-gkbbl-0"
 ZONES = 4
 GAMMA = [1.0]
 PROFILE_DIR = Path.home() / ".config" / "nitro-control" / "rgb-profiles"
+PRESET_DIR = Path.home() / ".config" / "nitro-control" / "presets"
 STATE_FILE = Path.home() / ".config" / "nitro-control" / "rgb-state.json"
+DEFAULT_FILE = Path.home() / ".config" / "nitro-control" / "rgb-default.json"
 
 COLORS = {
     "red": "ff0000", "green": "00ff00", "blue": "0000ff", "white": "ffffff",
@@ -89,6 +92,38 @@ def parse_color(s):
         return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
     except ValueError:
         return (150, 40, 255)
+
+
+def parse_zones(spec):
+    """'red,#00ff00,,blue' -> 4 rgb tuples; blank entries stay None so the
+    effect keeps its own natural colour for that zone."""
+    if not spec:
+        return None
+    parts = spec.split(",") if isinstance(spec, str) else list(spec)
+    if not any(str(p).strip() for p in parts):
+        return None
+    out = []
+    for z in range(ZONES):
+        p = str(parts[z]).strip() if z < len(parts) else ""
+        out.append(parse_color(p) if p else None)
+    return out
+
+
+def zone_col(a, z, fallback):
+    """Per-zone colour override, falling back to the effect's own colour."""
+    zc = getattr(a, "zone_rgb", None)
+    if zc and zc[z] is not None:
+        return zc[z]
+    return fallback
+
+
+def _gains(a):
+    """(bass, spectrum) sensitivity multipliers for the sound effects."""
+    return getattr(a, "bass_gain", 1.0), getattr(a, "spec_gain", 1.0)
+
+
+def clamp01(x):
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
 
 
 def scale(c, k):
@@ -164,11 +199,23 @@ class AudioLevel:
     """Reads the default sink monitor via parec in a thread and exposes a
     smoothed 0..1 loudness level. Degrades to 0 if audio is unavailable."""
     _inst = None
+    NBANDS = 4
+    FLOOR = 6e-4        # below this a band counts as silent (stops noise flicker)
+    GFLOOR = 3e-3       # floor for the shared peak, so silence isn't amplified
+    # Music carries far less energy up top than in the bass; these compensate
+    # that natural tilt so the treble zones aren't permanently dark.
+    TILT = (1.0, 1.7, 3.2, 5.5)
 
     def __init__(self):
-        self.level = 0.0
+        self.level = 0.0                   # raw loudness, no auto-levelling
+        self.vol = 0.0                     # auto-levelled loudness 0..1
+        self.bands = [0.0] * self.NBANDS   # bass -> treble, each 0..1
         self.ok = False
         self._run = True
+        # live-tunable analysis, driven by the GUI's sound sliders
+        self.release = 0.78     # smoothing: how slowly a level falls back
+        self.gate = 0.04        # noise gate: 0..1, silences quiet room noise
+        self.decay = 0.997      # auto-level: how fast the reference peak drops
         threading.Thread(target=self._loop, daemon=True).start()
 
     @classmethod
@@ -176,6 +223,19 @@ class AudioLevel:
         if cls._inst is None:
             cls._inst = AudioLevel()
         return cls._inst
+
+    def set_params(self, smooth, gate, adapt):
+        """Map the three 0..1 user sliders onto the analyser's coefficients."""
+        self.release = 0.55 + 0.40 * clamp01(smooth)
+        self.gate = 0.30 * clamp01(gate)
+        # 'adapt' 0 = re-level quickly (quiet music still fills the zones),
+        # 1 = hold a steady reference so real dynamics stay visible.
+        self.decay = 0.985 + 0.0145 * clamp01(adapt)
+
+    def _shape(self, v):
+        """Apply the noise gate and re-expand what's left over 0..1."""
+        g = self.gate
+        return 0.0 if v < g else (v - g) / (1.0 - g) if g < 1.0 else 0.0
 
     def _monitor_source(self):
         try:
@@ -207,15 +267,51 @@ class AudioLevel:
         self.ok = True
         chunk = 1024  # samples
         nbytes = chunk * 2
+        # one-pole low-pass states for a cheap 4-band split (bass..treble),
+        # crossovers ~150 / 800 / 3000 Hz at the 22.05 kHz capture rate.
+        la = lb = lc = 0.0
+        aa, ab, ac = 0.0419, 0.2039, 0.5747
+        gpeak = self.GFLOOR
         while self._run:
             data = p.stdout.read(nbytes)
             if not data or len(data) < nbytes:
                 break
             samples = struct.unpack("<%dh" % (len(data) // 2), data)
-            rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
-            lvl = min(1.0, rms / 9000.0)          # normalise
-            # fast attack, slow release
-            self.level = max(lvl, self.level * 0.82)
+            n = len(samples)
+            e_total = e0 = e1 = e2 = e3 = 0.0
+            for s in samples:
+                x = s / 32768.0
+                la += aa * (x - la)
+                lb += ab * (x - lb)
+                lc += ac * (x - lc)
+                lomid = lb - la
+                himid = lc - lb
+                treble = x - lc
+                e0 += la * la
+                e1 += lomid * lomid
+                e2 += himid * himid
+                e3 += treble * treble
+                e_total += x * x
+            rel, dec = self.release, self.decay
+            self.level = max(min(1.0, (e_total / n) ** 0.5 * 3.5), self.level * rel)
+            comp = [(e / n) ** 0.5 * g for e, g in zip((e0, e1, e2, e3), self.TILT)]
+            # Normalise every band against ONE shared peak, not its own: a
+            # per-band AGC would make each band self-normalise to full scale
+            # and all four zones would just sit lit. This keeps the bands'
+            # relative levels intact while still adapting to overall volume.
+            gpeak = max(max(comp), gpeak * dec, self.GFLOOR)
+            inst = []
+            for i, c in enumerate(comp):
+                v = 0.0 if c < self.FLOOR else min(1.0, (c / gpeak) ** 0.6)
+                v = self._shape(v)
+                inst.append(v)
+                self.bands[i] = max(v, self.bands[i] * rel)
+            # Broadband loudness, built from the bands and therefore sharing
+            # their reference peak. Giving it a peak of its own would make it
+            # normalise to full scale and sit pinned; feeding it raw rms (what
+            # the VU used to do) leaves it stuck near the bottom instead.
+            self.vol = max((sum(v * v for v in inst) / self.NBANDS) ** 0.5,
+                           self.vol * rel)
         self.ok = False
 
 
@@ -443,29 +539,94 @@ def fx_battery(t, a):
     return out
 
 
+_SOUND_HUES = (0.0, 0.11, 0.42, 0.55)   # bass=red, low-mid=amber, mid=green, treble=cyan
+
+
+def _sfx(a):
+    """Shared setup for every sound effect: push the user's analysis sliders
+    into the analyser, then hand back everything the effects need. Keeping this
+    in one place is what makes the three presets behave consistently."""
+    au = AudioLevel.get()
+    au.set_params(getattr(a, "snd_smooth", 0.57),
+                  getattr(a, "snd_gate", 0.13),
+                  getattr(a, "snd_adapt", 0.5))
+    bg, sg = _gains(a)
+    # Resting glow: what the zones sit at in silence. Without it a quiet moment
+    # is indistinguishable from the keyboard being switched off.
+    glow = max(0.0, min(0.6, getattr(a, "glow", 0.08)))
+    return au, _amp(a), bg, sg, glow
+
+
+def _vu_level(au, a):
+    """The signal the volume meter rides on (--vu-source)."""
+    src = str(getattr(a, "vu_source", "full") or "full")
+    if src == "bass":
+        return au.bands[0]
+    if src == "nobass":      # mids + treble only, so bass isn't counted twice
+        rest = au.bands[1:]
+        return (sum(v * v for v in rest) / max(1, len(rest))) ** 0.5
+    return au.vol
+
+
 def fx_sound(t, a):
-    """Sound bar: zones fill left->right with loudness over a dim base.
-    Colour = custom (--color) or shifts green->red as it gets louder."""
-    lvl = AudioLevel.get().level
-    lit = lvl * ZONES
-    out = []
-    for z in range(ZONES):
-        k = max(0.0, min(1.0, lit - z))
-        if a.color_set:
-            col = a.rgb
-        else:
-            col = hsv(0.33 * (1 - z / (ZONES - 1)))  # green..red
-        base = scale(col, 0.06)
-        out.append(lerp(base, col, k))
+    """SOUND spectrum: each zone reacts to a frequency band — bass on the left,
+    treble on the right (--spec-reverse flips it). --color tints every zone;
+    --zone-colors sets each zone individually; --bass-gain / --spec-gain tune
+    how hard each end reacts."""
+    au, amp, bg, sg, glow = _sfx(a)
+    order = list(range(ZONES))
+    if getattr(a, "spec_reverse", False):
+        order.reverse()
+    out = [(0, 0, 0)] * ZONES
+    for band, z in enumerate(order):
+        v = clamp01(au.bands[band] * amp * (bg if band == 0 else sg))
+        base = a.rgb if a.color_set else hsv(_SOUND_HUES[band])
+        col = zone_col(a, z, base)
+        out[z] = lerp(scale(col, glow), col, v)
     return out
 
 
+def fx_soundbass(t, a):
+    """SOUND bass+VU: one zone is a dedicated BASS meter (--bass-zone, default
+    zone 4 = far right); the remaining zones form a volume meter that fills
+    from zone 1 outwards, or the other way with --vu-reverse. Climbs green ->
+    amber -> red. Per-zone colours and both gains apply."""
+    au, amp, bg, sg, glow = _sfx(a)
+    out = [(0, 0, 0)] * ZONES
+
+    bz = max(1, min(ZONES, int(getattr(a, "bass_zone", ZONES)))) - 1
+    bass = clamp01(au.bands[0] * amp * bg)
+    bcol = zone_col(a, bz, a.rgb if a.color_set else parse_color("red"))
+    out[bz] = lerp(scale(bcol, glow), bcol, bass)
+
+    order = [z for z in range(ZONES) if z != bz]      # fills in this order
+    if getattr(a, "vu_reverse", False):
+        order.reverse()
+    lit = clamp01(_vu_level(au, a) * amp * sg) * len(order)
+    span = max(1, len(order) - 1)
+    for i, z in enumerate(order):
+        k = clamp01(lit - i)
+        base = a.rgb if a.color_set else hsv(0.33 * (1 - i / span))
+        col = zone_col(a, z, base)
+        out[z] = lerp(scale(col, glow), col, k)
+    return out
+
+
+def fx_zones(t, a):
+    """Static per-zone colours — paint each of the 4 zones its own colour."""
+    zc = getattr(a, "zone_rgb", None)
+    if not zc:
+        return [a.rgb] * ZONES
+    return [zc[z] if zc[z] is not None else a.rgb for z in range(ZONES)]
+
+
 def fx_soundwave(t, a):
-    """Sound pulse: keyboard dark, all zones light up by loudness with a little
-    per-zone shimmer. Colour = custom, or cycles hue over time."""
-    lvl = AudioLevel.get().level
-    col = a.rgb if a.color_set else hsv(t * 0.1)
-    return [scale(col, max(0.0, min(1.0, lvl * (0.7 + 0.5 * math.sin(t * 6 + z))))) for z in range(ZONES)]
+    """SOUND pulse: one steady colour across the whole board — nothing moves,
+    only the BRIGHTNESS follows the music (bass-weighted). --color sets the
+    colour, --amplitude the sensitivity."""
+    au, amp, bg, sg, glow = _sfx(a)
+    drive = clamp01(max(au.vol * sg, au.bands[0] * bg) * amp)
+    return [scale(a.rgb, glow + (1.0 - glow) * drive)] * ZONES
 
 
 EFFECTS = {
@@ -498,17 +659,28 @@ EFFECTS = {
     "disco": (fx_disco, "Random colours to a beat"),
     "sunrise": (fx_sunrise, "Slow sunrise"),
     "sos": (fx_sos, "Blinks S-O-S in Morse (--color)"),
-    "sound": (fx_sound, "SOUND: VU bar reacting to system audio (--color)"),
-    "soundwave": (fx_soundwave, "SOUND: dark board pulsing with audio (--color)"),
+    "sound": (fx_sound, "SOUND: 4-band spectrum bar, bass left -> treble right"),
+    "soundbass": (fx_soundbass, "SOUND: dedicated bass zone (--bass-zone) + volume VU on the rest"),
+    "soundwave": (fx_soundwave, "SOUND: whole board brightness follows the music (no motion)"),
+    "zones": (fx_zones, "Static per-zone colours (--zone-colors red,gold,green,blue)"),
     "cpu": (fx_cpu, "LIVE: CPU load meter"),
     "temp": (fx_temp, "LIVE: CPU temperature"),
     "battery": (fx_battery, "LIVE: battery charge meter"),
     "off": (lambda t, a: [(0, 0, 0)] * ZONES, "All zones off"),
 }
 
-STATIC_EFFECTS = {"solid", "gradient", "gradient2", "off"}
+STATIC_EFFECTS = {"solid", "gradient", "gradient2", "zones", "off"}
+SOUND_EFFECTS = {"sound", "soundbass", "soundwave"}
 PROFILE_KEYS = ("effect", "seconds", "brightness", "speed", "amplitude", "fps",
-                "color", "color2", "reverse", "gamma")
+                "color", "color2", "reverse", "gamma", "zone_colors",
+                "bass_gain", "spec_gain", "bass_zone", "vu_reverse",
+                "vu_source", "spec_reverse", "glow", "snd_smooth",
+                "snd_gate", "snd_adapt")
+# Everything a saved look is made of — used for presets and the boot default.
+STATE_KEYS = ("effect", "brightness", "speed", "amplitude", "color", "color2",
+              "idle_off", "zone_colors", "bass_gain", "spec_gain", "bass_zone",
+              "vu_reverse", "vu_source", "spec_reverse", "glow", "snd_smooth",
+              "snd_gate", "snd_adapt", "fps", "gamma", "reverse")
 
 
 def run_effect(name, a, seconds, fps=None):
@@ -528,47 +700,186 @@ def run_effect(name, a, seconds, fps=None):
 
 # ---- idle input monitor (for daemon idle-off / wake-on-keypress) -------------
 class IdleMonitor:
-    def __init__(self):
-        self.fds = []
-        for path in glob.glob("/dev/input/event*"):
-            try:
-                self.fds.append(os.open(path, os.O_RDONLY | os.O_NONBLOCK))
-            except Exception:
-                pass
-        self.ok = bool(self.fds)
-        self.last = time.monotonic()
+    """Time since the last real user input, read straight from evdev.
 
-    def poll(self):
-        if not self.ok:
+    Two things make the naive "glob /dev/input/event* once at startup" approach
+    unreliable, and both are handled here:
+
+      * Key remappers (input-remapper, keyd, kmonad...) EVIOCGRAB the physical
+        keyboard and re-emit keystrokes on a *virtual* node created later. Hold
+        only the original and typing looks like idleness, so the lights drop
+        while you are mid-sentence.
+      * Devices come and go — remapper reloads, USB/Bluetooth keyboards, resume.
+
+    So the device set is refreshed whenever /dev/input changes (one cheap stat,
+    not a re-glob), and only nodes that actually report keys/motion are opened.
+    """
+    EV_KEY, EV_REL, EV_ABS = 0x2, 0x4, 0x8   # bit N of the EV mask = event type N
+    SCAN_THROTTLE = 1.0
+
+    def __init__(self):
+        self.fds = {}                 # path -> fd
+        self.ok = False
+        self.last = time.monotonic()
+        self._dir_mtime = None
+        self._next_scan = 0.0
+        self._scan(force=True)
+
+    @classmethod
+    def _wanted(cls):
+        """Event nodes that report keys, pointer motion or touch — skipping
+        jack-sense, lid and PC-speaker nodes that never signal user presence."""
+        try:
+            text = open("/proc/bus/input/devices").read()
+        except Exception:
+            return set(glob.glob("/dev/input/event*"))
+        want, care = set(), cls.EV_KEY | cls.EV_REL | cls.EV_ABS
+        for block in text.split("\n\n"):
+            node, ev = None, 0
+            for line in block.splitlines():
+                if line.startswith("H: Handlers"):
+                    for tok in line.split("=", 1)[-1].split():
+                        if tok.startswith("event"):
+                            node = "/dev/input/" + tok
+                elif line.startswith("B: EV="):
+                    try:
+                        ev = int(line.split("=", 1)[-1], 16)
+                    except ValueError:
+                        ev = 0
+            if node and ev & care:
+                want.add(node)
+        return want or set(glob.glob("/dev/input/event*"))
+
+    def _scan(self, force=False):
+        now = time.monotonic()
+        if not force and now < self._next_scan:
             return
-        r, _, _ = select.select(self.fds, [], [], 0)
-        if r:
-            for fd in r:
+        self._next_scan = now + self.SCAN_THROTTLE
+        try:
+            mtime = os.stat("/dev/input").st_mtime_ns
+        except Exception:
+            mtime = None
+        if not force and mtime == self._dir_mtime:
+            return                     # nothing added or removed since last look
+        self._dir_mtime = mtime
+        want = self._wanted()
+        for path in [p for p in self.fds if p not in want]:
+            try:
+                os.close(self.fds.pop(path))
+            except Exception:
+                self.fds.pop(path, None)
+        for path in want:
+            if path not in self.fds:
                 try:
-                    while os.read(fd, 4096):
-                        pass
+                    self.fds[path] = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                 except Exception:
                     pass
-            self.last = time.monotonic()
+        self.ok = bool(self.fds)
+
+    def _drain(self, fds):
+        for fd in fds:
+            try:
+                while os.read(fd, 4096):
+                    pass
+            except BlockingIOError:
+                pass
+            except OSError:
+                self._dir_mtime = None      # device vanished — rescan next tick
+                self._next_scan = 0.0
+        self.last = time.monotonic()
+
+    def wait(self, timeout):
+        """Sleep up to `timeout`, returning the moment any input arrives. Used
+        instead of time.sleep() while the lights are idle-off, so waking is
+        instant and the daemon isn't spinning at 10 Hz doing nothing."""
+        self._scan()
+        if not self.fds:
+            time.sleep(timeout)
+            return False
+        try:
+            r, _, _ = select.select(list(self.fds.values()), [], [], timeout)
+        except Exception:
+            self._scan(force=True)
+            return False
+        if r:
+            self._drain(r)
+            return True
+        return False
+
+    def poll(self):
+        self.wait(0)
 
     def idle_for(self):
         return time.monotonic() - self.last
 
 
 # ---- state + daemon ----------------------------------------------------------
+FALLBACK_STATE = {"effect": "gradient", "brightness": 100, "speed": 1.0, "color": None}
+_state_cache = {"sig": None, "data": None}
+
+
+def write_json(path, data):
+    """Write atomically: the daemon polls these files constantly and must never
+    catch a half-written one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
 def read_state():
+    """Cached on (mtime, size), so a busy render loop costs one stat() per frame
+    instead of a full re-read and JSON parse. A torn or unreadable file keeps
+    the last good state rather than snapping back to hardcoded defaults."""
     try:
-        return json.loads(STATE_FILE.read_text())
+        s = STATE_FILE.stat()
+        sig = (s.st_mtime_ns, s.st_size)
     except Exception:
-        return {"effect": "gradient", "brightness": 100, "speed": 1.0, "color": None}
+        return _state_cache["data"] or dict(FALLBACK_STATE)
+    if sig == _state_cache["sig"] and _state_cache["data"] is not None:
+        return _state_cache["data"]
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except Exception:
+        return _state_cache["data"] or dict(FALLBACK_STATE)
+    _state_cache["sig"], _state_cache["data"] = sig, data
+    return data
 
 
 def write_state(**kw):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    st = read_state()
+    st = dict(read_state())
     st.update(kw)
-    STATE_FILE.write_text(json.dumps(st, indent=2))
+    write_json(STATE_FILE, st)
+    _state_cache["sig"] = None
     return st
+
+
+# ---- presets (named looks the GUI saves and restores) ------------------------
+def preset_path(name):
+    safe = "".join(c for c in str(name) if c.isalnum() or c in " _-").strip()
+    return PRESET_DIR / f"{safe or 'preset'}.json"
+
+
+def list_presets():
+    try:
+        return sorted(f.stem for f in PRESET_DIR.glob("*.json"))
+    except Exception:
+        return []
+
+
+def save_preset(name, state=None):
+    st = state if state is not None else read_state()
+    write_json(preset_path(name), {k: st[k] for k in STATE_KEYS if k in st})
+
+
+def load_preset(name):
+    f = preset_path(name)
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text())
+    except Exception:
+        return None
 
 
 def _state_to_args(st):
@@ -584,14 +895,31 @@ def _state_to_args(st):
     a.rgb = parse_color(col) if a.color_set else parse_color("purple")
     c2 = st.get("color2")
     a.rgb2 = parse_color(c2) if c2 else parse_color("cyan")
+    a.zone_rgb = parse_zones(st.get("zone_colors"))
+    a.bass_gain = float(st.get("bass_gain", 1.0))
+    a.spec_gain = float(st.get("spec_gain", 1.0))
+    a.bass_zone = int(st.get("bass_zone", ZONES) or ZONES)
+    a.vu_reverse = bool(st.get("vu_reverse", False))
+    a.vu_source = st.get("vu_source", "full") or "full"
+    a.spec_reverse = bool(st.get("spec_reverse", False))
+    a.glow = float(st.get("glow", 0.08))
+    a.snd_smooth = float(st.get("snd_smooth", 0.57))
+    a.snd_gate = float(st.get("snd_gate", 0.13))
+    a.snd_adapt = float(st.get("snd_adapt", 0.5))
     return a
+
+
+FADE_OUT = 0.6          # seconds: dip to black when the idle timer fires
+FADE_IN = 0.35          # seconds: swell back up on the first keypress
 
 
 def daemon():
     idle = IdleMonitor()
     t0 = time.monotonic()
     last_static = None
+    last_frame = [(0, 0, 0)] * ZONES
     off_frame = [(0, 0, 0)] * ZONES
+    wake_until = 0.0
     while True:
         st = read_state()
         a = _state_to_args(st)
@@ -607,19 +935,37 @@ def daemon():
         t = time.monotonic() - t0
         if idled:
             if last_static != "idled":
+                # Ease down rather than cutting, so the idle timer is obviously
+                # the idle timer and not the effect having gone quiet.
+                for i in range(1, 9):
+                    show(last_frame, int(a.brightness * (1 - i / 8.0)))
+                    time.sleep(FADE_OUT / 8)
                 show(off_frame, a.brightness)
                 last_static = "idled"
-            time.sleep(0.1)
+                wake_until = 0.0
+            if idle.wait(0.5):      # returns instantly on the first keypress
+                wake_until = time.monotonic() + FADE_IN
         elif eff in STATIC_EFFECTS:
             key = json.dumps(st, sort_keys=True)
-            if key != last_static:
-                show(fn(t, a), a.brightness)
-                last_static = key
-            time.sleep(0.12)
+            waking = time.monotonic() < wake_until
+            if key != last_static or waking:
+                last_frame = fn(t, a)
+                show(last_frame, _wake_brightness(a.brightness, wake_until))
+                # forget the key while fading in, so the last step lands at full
+                last_static = None if waking else key
+            time.sleep(0.03 if waking else 0.12)
         else:
             last_static = None
-            show(fn(t, a), a.brightness)
+            last_frame = fn(t, a)
+            show(last_frame, _wake_brightness(a.brightness, wake_until))
             time.sleep(1.0 / max(1.0, a.fps))
+
+
+def _wake_brightness(brightness, wake_until):
+    left = wake_until - time.monotonic()
+    if left <= 0:
+        return brightness
+    return max(1, int(brightness * (1.0 - left / FADE_IN)))
 
 
 # ---- profiles ----------------------------------------------------------------
@@ -658,6 +1004,8 @@ def showcase(a):
 def main():
     p = argparse.ArgumentParser(description="Custom + live + sound RGB effects for the Nitro keyboard.")
     p.add_argument("effect", nargs="?", default="showcase")
+    p.add_argument("name", nargs="?", default=None,
+                   help="preset name, for the preset/save-preset/del-preset commands")
     p.add_argument("--seconds", type=float, default=0)
     p.add_argument("--brightness", type=int, default=100)
     p.add_argument("--speed", type=float, default=1.0)
@@ -665,6 +1013,30 @@ def main():
     p.add_argument("--fps", type=float, default=18)
     p.add_argument("--color", default=None)
     p.add_argument("--color2", default=None)
+    p.add_argument("--zone-colors", dest="zone_colors", default=None,
+                   help="per-zone colours, left to right: 'red,gold,green,blue' "
+                        "(leave an entry blank to keep the effect's own colour)")
+    p.add_argument("--bass-gain", dest="bass_gain", type=float, default=1.0,
+                   help="sound effects: how hard the bass reacts")
+    p.add_argument("--spec-gain", dest="spec_gain", type=float, default=1.0,
+                   help="sound effects: how hard the rest of the spectrum reacts")
+    p.add_argument("--bass-zone", dest="bass_zone", type=int, default=ZONES,
+                   help="soundbass: which zone (1-4) is the dedicated bass meter")
+    p.add_argument("--vu-reverse", dest="vu_reverse", action="store_true",
+                   help="soundbass: fill the volume meter from the far end instead")
+    p.add_argument("--vu-source", dest="vu_source", default="full",
+                   choices=("full", "nobass", "bass"),
+                   help="soundbass: what the volume meter rides on")
+    p.add_argument("--spec-reverse", dest="spec_reverse", action="store_true",
+                   help="sound: put the bass on the right instead of the left")
+    p.add_argument("--glow", type=float, default=0.08,
+                   help="sound effects: resting glow in silence, 0-0.6 (default 0.08)")
+    p.add_argument("--smoothing", dest="snd_smooth", type=float, default=0.57,
+                   help="sound effects: 0 = snappy, 1 = smooth (default 0.57)")
+    p.add_argument("--gate", dest="snd_gate", type=float, default=0.13,
+                   help="sound effects: noise gate, 0-1 (default 0.13)")
+    p.add_argument("--adapt", dest="snd_adapt", type=float, default=0.5,
+                   help="sound effects: auto-level, 0 = quick, 1 = steady (default 0.5)")
     p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--reverse", action="store_true")
     p.add_argument("--save")
@@ -677,6 +1049,7 @@ def main():
     a.color_set = a.color is not None
     a.rgb = parse_color(a.color) if a.color_set else parse_color("purple")
     a.rgb2 = parse_color(a.color2) if a.color2 else parse_color("cyan")
+    a.zone_rgb = parse_zones(a.zone_colors)
     a.amp = a.amplitude
     GAMMA[0] = a.gamma
 
@@ -688,12 +1061,41 @@ def main():
         return
     if a.effect == "set":
         kw = {"brightness": a.brightness, "speed": a.speed, "amplitude": a.amplitude,
-              "fps": a.fps, "gamma": a.gamma, "reverse": a.reverse, "color": a.color}
+              "fps": a.fps, "gamma": a.gamma, "reverse": a.reverse, "color": a.color,
+              "bass_gain": a.bass_gain, "spec_gain": a.spec_gain,
+              "bass_zone": a.bass_zone, "vu_reverse": a.vu_reverse,
+              "vu_source": a.vu_source, "spec_reverse": a.spec_reverse,
+              "glow": a.glow, "snd_smooth": a.snd_smooth,
+              "snd_gate": a.snd_gate, "snd_adapt": a.snd_adapt}
         if a.set_effect:
             kw["effect"] = a.set_effect
         if a.color2:
             kw["color2"] = a.color2
+        if a.zone_colors is not None:
+            kw["zone_colors"] = a.zone_colors or None
         write_state(**kw)
+        return
+    if a.effect == "presets":
+        for n in list_presets():
+            print(" ", n)
+        return
+    if a.effect in ("preset", "save-preset", "del-preset"):
+        if not a.name:
+            print(f"usage: nitro-rgb-fx {a.effect} <name>", file=sys.stderr)
+            sys.exit(2)
+        if a.effect == "save-preset":
+            save_preset(a.name)
+            print(f"saved preset '{a.name}'")
+        elif a.effect == "del-preset":
+            preset_path(a.name).unlink(missing_ok=True)
+            print(f"deleted preset '{a.name}'")
+        else:
+            st = load_preset(a.name)
+            if st is None:
+                print(f"no such preset '{a.name}'", file=sys.stderr)
+                sys.exit(1)
+            write_state(**st)
+            print(f"applied preset '{a.name}'")
         return
     if a.effect == "list":
         for k, (_, desc) in EFFECTS.items():
