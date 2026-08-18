@@ -1,0 +1,10 @@
+[Unit]
+Description=Nitro control: finish battery calibration once the pack is full again
+Documentation=https://github.com/0PlayMaker/nitro-control
+ConditionPathExists=/usr/local/bin/nitroctl
+
+[Service]
+Type=oneshot
+# A no-op unless a calibration session is recorded, so this is cheap to run
+# often. It exists so the charge limit is restored even if nobody is watching.
+ExecStart=/usr/local/bin/nitroctl battery calibrate check

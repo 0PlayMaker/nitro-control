@@ -20,7 +20,8 @@ reboots, suspend and kernel updates** — the thing that actually matters.
 - 🩺 **Battery gauge calibration** — a guided full discharge/recharge cycle so the
   firmware's fuel gauge can re-learn the pack's real capacity, for when the
   reported charge starts jumping or the wear figure looks wrong. The charge
-  limit is stood down for the duration and restored afterwards.
+  limit is stood down for the duration, and **a systemd timer finishes the cycle
+  and restores the limit by itself** — start it and walk away.
 - ⌨️ **4-zone RGB keyboard** with **35+ software effects**: rainbow, plasma, aurora,
   ocean, fire, candle, comet, meteor, breathe, wave, twinkle, lightning, matrix,
   vaporwave, police, heartbeat, disco, sunrise, and more.
@@ -71,7 +72,14 @@ Verified on: AN517-41, BIOS V1.08, Fedora 44, kernel 7.1.x, Ryzen 7 5800H + RTX 
   something is written to it, so it can read stale; nitro-control records its
   own session in `config.json` and treats that as the truth, stands `boot-apply`
   down while a cycle runs (re-asserting the 80% limit would stop the pack
-  reaching full and stall it), and restores the previous limit when you finish.
+  reaching full and stall it), and restores the previous limit at the end.
+  A cycle charges to full *first*, then discharges, then recharges — so "the
+  battery is full" is not on its own a finish signal. `nitro-control-calibration
+  .timer` polls every 5 minutes and completes the cycle only once the pack has
+  actually been down near empty *and* come back to full, tracked by the lowest
+  charge seen rather than by catching the exact moment it bottoms out. A 48-hour
+  backstop restores the limit even if a cycle never completes, because leaving
+  it off for days is worse than an unfinished calibration.
 - **RGB**: the [`facer`](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module)
   kernel module (installed via DKMS), driven by a small persistent daemon that
   renders effects frame-by-frame over `/dev/acer-gkbbl-static-0`.

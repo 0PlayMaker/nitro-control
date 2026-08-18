@@ -123,6 +123,10 @@ install_core() {
     add_installed "/etc/nitro-control/config.json"; fi
 
   run install -m 0644 "$REPO/systemd/nitro-control.service" /etc/systemd/system/nitro-control.service
+  run install -m 0644 "$REPO/systemd/nitro-control-calibration.service" \
+      /etc/systemd/system/nitro-control-calibration.service
+  run install -m 0644 "$REPO/systemd/nitro-control-calibration.timer" \
+      /etc/systemd/system/nitro-control-calibration.timer
   run install -m 0755 "$REPO/systemd/nitro-control-sleep.sh" /usr/lib/systemd/system-sleep/nitro-control
   run install -m 0644 "$REPO/udev/99-nitro-control.rules" /etc/udev/rules.d/99-nitro-control.rules
   run systemctl daemon-reload
@@ -266,6 +270,10 @@ install_core
 # Enable boot service + fix perms (after modules are in place)
 if [ "$CHECK" -eq 0 ]; then
   systemctl enable --now nitro-control.service 2>/dev/null || true
+  # The calibration finisher: a no-op unless a cycle is running, but it must be
+  # armed in advance so a cycle can never be left half-done with the charge
+  # limit switched off.
+  systemctl enable --now nitro-control-calibration.timer 2>/dev/null || true
   nitroctl fix-perms 2>/dev/null || true
 fi
 

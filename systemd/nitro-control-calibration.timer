@@ -1,0 +1,14 @@
+[Unit]
+Description=Check battery calibration progress every few minutes
+Documentation=https://github.com/0PlayMaker/nitro-control
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=1min
+# Catch up after suspend or a powered-off stretch, so a cycle that completed
+# while the machine was asleep is finished at the next opportunity.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

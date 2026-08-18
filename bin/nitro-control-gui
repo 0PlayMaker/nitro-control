@@ -278,6 +278,7 @@ class MainWindow(QMainWindow):
         # Last battery poll, so the calibration button can check AC and session
         # state without shelling out again on every click.
         self._last_batt = {}
+        self._calib_was_running = False
 
         self.setWindowTitle("Nitro Control")
         self.setWindowIcon(make_icon())
@@ -443,6 +444,13 @@ class MainWindow(QMainWindow):
         """Reflect the battery poll into the calibration box."""
         supported = bool(b.get("calibration_supported"))
         running = supported and bool(b.get("calibration_active"))
+        # The timer can finish a cycle while nobody is looking, so say so.
+        if self._calib_was_running and not running and supported:
+            self.tray.showMessage(
+                "Nitro Control",
+                "Battery calibration finished — the charge limit is back on.",
+                make_icon(), 6000)
+        self._calib_was_running = running
         # Turning the charge limit back on mid-cycle would stop the pack ever
         # reaching full and quietly stall the calibration, so take it out of
         # reach for the duration rather than letting it be undone by accident.

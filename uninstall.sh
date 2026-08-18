@@ -30,6 +30,13 @@ target_user() { echo "${SUDO_USER:-$(logname 2>/dev/null || echo root)}"; }
 log "starting uninstall (purge=$PURGE keep_config=$KEEP_CONFIG)"
 
 # 1. stop services
+# End any calibration cycle first, while nitroctl is still installed — it puts
+# the charge limit back. Otherwise uninstalling mid-cycle would leave the
+# machine charging to 100% forever with nothing left to restore the limit.
+nitroctl battery calibrate stop 2>/dev/null || true
+systemctl disable --now nitro-control-calibration.timer 2>/dev/null || true
+rm -f /etc/systemd/system/nitro-control-calibration.timer
+rm -f /etc/systemd/system/nitro-control-calibration.service
 systemctl disable --now nitro-control.service 2>/dev/null || true
 rm -f /etc/systemd/system/nitro-control.service
 rm -f /usr/lib/systemd/system-sleep/nitro-control

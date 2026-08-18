@@ -236,6 +236,16 @@ def battery_set(on):
 # the session record in config.json - not sysfs - is what we treat as the truth
 # about whether *we* started a cycle.
 
+# Completion thresholds. A cycle is only finished once the pack has actually
+# been down near empty *and* come back to full — "full" on its own is useless,
+# because a cycle starts by charging to full before it discharges at all.
+CALIB_LOW_PCT = 10       # counts as "ran down"
+CALIB_FULL_PCT = 99      # counts as "back to full"
+# Backstop: leaving the charge limit off for days is worse than an unfinished
+# calibration, so give up and restore it if a cycle never completes.
+CALIB_MAX_HOURS = 48
+
+
 def calibration_supported():
     v = read_int(CALIBRATION_MODE)
     return v is not None and v >= 0
@@ -258,9 +268,14 @@ def _set_calibration(on):
 
 def battery_calibrate(args):
     sub = args[0] if args else "status"
-    if sub not in ("start", "stop", "status"):
-        print("usage: nitroctl battery calibrate {start|stop|status}", file=sys.stderr)
+    if sub not in ("start", "stop", "status", "check"):
+        print("usage: nitroctl battery calibrate {start|stop|status|check}",
+              file=sys.stderr)
         return 2
+    if sub == "check":
+        # Runs unattended from a timer; must stay quiet and succeed when there
+        # is nothing to do, including when the driver isn't there at all.
+        return calibration_check()
     if not os.path.exists(CALIBRATION_MODE):
         print("error: acer-wmi-battery not loaded (no calibration_mode)", file=sys.stderr)
         return 2
@@ -274,6 +289,54 @@ def battery_calibrate(args):
     return _calibration_stop()
 
 
+def calibration_check():
+    """Advance a running cycle and finish it automatically when it's done.
+
+    Called from a systemd timer, so the charge limit comes back even if nobody
+    is watching. Progress is tracked by the lowest charge seen rather than by
+    catching the exact moment the pack hits empty — a poll every few minutes
+    would otherwise miss it, and the machine may well power off down there.
+    """
+    sess = calibration_session()
+    if not sess or not os.path.exists(CALIBRATION_MODE):
+        return 0
+    b = battery_info()
+    cap = b["capacity"]
+    status = (b["status"] or "").strip()
+    cfg = load_config()
+    s = cfg.get("battery", {}).get("calibration")
+    if not isinstance(s, dict) or not s.get("active"):
+        return 0
+
+    low = s.get("min_seen")
+    if cap is not None and (low is None or cap < low):
+        s["min_seen"] = low = cap
+        save_config(cfg)
+
+    ran_down = low is not None and low <= CALIB_LOW_PCT
+    back_full = (cap is not None and cap >= CALIB_FULL_PCT
+                 and status in ("Full", "Not charging"))
+
+    if ran_down and back_full:
+        print(f"calibration complete (low was {low}%, now {cap}% {status}) — finishing")
+        return _calibration_stop()
+
+    if _session_hours(s) > CALIB_MAX_HOURS:
+        print(f"calibration has run for over {CALIB_MAX_HOURS}h without completing "
+              f"(lowest charge seen {low}%) — restoring the charge limit", file=sys.stderr)
+        return _calibration_stop()
+    return 0
+
+
+def _session_hours(s):
+    import datetime
+    try:
+        started = datetime.datetime.strptime(s.get("started", ""), "%Y-%m-%d %H:%M")
+    except (ValueError, TypeError):
+        return 0.0
+    return (datetime.datetime.now() - started).total_seconds() / 3600.0
+
+
 def _calibration_status():
     sess = calibration_session()
     b = battery_info()
@@ -281,18 +344,34 @@ def _calibration_status():
     print(f"calibration mode : {'ON' if raw else 'off'}  (driver value; "
           f"refreshed only on write, so it can lag)")
     if sess:
-        print(f"session          : started {sess.get('started', '?')}")
+        low = sess.get("min_seen")
+        print(f"session          : started {sess.get('started', '?')}  "
+              f"({_session_hours(sess):.1f}h ago)")
         print(f"                   health limit will be restored to "
-              f"{'ON' if sess.get('restore_health_mode') else 'OFF'} when you stop")
+              f"{'ON' if sess.get('restore_health_mode') else 'OFF'} when it finishes")
+        ran_down = low is not None and low <= CALIB_LOW_PCT
+        print(f"progress         : {'discharged, now recharging' if ran_down else 'waiting for the pack to run down'}"
+              f"  (lowest seen {low if low is not None else '—'}%)")
     else:
         print("session          : none started by nitro-control")
     print(f"charge           : {b['capacity']}%  ({b['status']})")
     print(f"AC               : {'plugged' if b['ac_online'] else 'on battery'}")
     if sess:
-        print("\nLeave the laptop plugged in. The pack will run down to empty and\n"
-              "back to full on its own; when it reads full again, finish with:\n"
-              "  nitroctl battery calibrate stop")
+        auto = _timer_active()
+        print(f"\nauto-finish      : {'ON — it will stop itself and restore the limit' if auto else 'OFF (timer not running; finish it yourself)'}")
+        if not auto:
+            print("  nitroctl battery calibrate stop")
     return 0
+
+
+def _timer_active():
+    """Is the unattended finisher actually running?"""
+    try:
+        p = subprocess.run(["systemctl", "is-active", "nitro-control-calibration.timer"],
+                           capture_output=True, text=True, timeout=5)
+        return p.stdout.strip() == "active"
+    except Exception:
+        return False
 
 
 def _calibration_start():
