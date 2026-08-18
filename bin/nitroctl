@@ -185,6 +185,7 @@ def battery_info():
         "health_mode": (bool(hm) if hm is not None else None),
         "calibration_supported": calibration_supported(),
         "calibration_active": bool(calibration_session()),
+        "last_calibration": load_config().get("battery", {}).get("last_calibration"),
         "capacity": read_int(BAT + "/capacity"),
         "status": read(BAT + "/status"),
         "ac_online": (bool(ac) if ac is not None else None),
@@ -354,6 +355,10 @@ def _calibration_status():
               f"  (lowest seen {low if low is not None else '—'}%)")
     else:
         print("session          : none started by nitro-control")
+        last = load_config().get("battery", {}).get("last_calibration")
+        if last:
+            _print_calibration_result(last)
+            print()
     print(f"charge           : {b['capacity']}%  ({b['status']})")
     print(f"AC               : {'plugged' if b['ac_online'] else 'on battery'}")
     if sess:
@@ -403,6 +408,10 @@ def _calibration_start():
         "active": True,
         "restore_health_mode": prev,
         "started": _now(),
+        # The whole point of a calibration is to correct these, so capture them
+        # now — afterwards there is nothing left to compare against.
+        "wear_before": b["wear_pct"],
+        "full_before": b["energy_full"],
     }
     # Keep the recorded health_mode in step with the hardware, so nothing else
     # reads config.json and re-asserts the limit behind our back.
@@ -428,10 +437,24 @@ def _calibration_stop():
         bool(cfg.get("battery", {}).get("health_mode", True))
     ok = _write_health_mode(restore)
     cfg.setdefault("battery", {})["calibration"] = {"active": False}
+    if sess:
+        # Keep the before/after so the result survives this process — a cycle
+        # usually finishes unattended, hours after anyone asked for it.
+        after = battery_info()
+        cfg["battery"]["last_calibration"] = {
+            "started": sess.get("started"),
+            "finished": _now(),
+            "wear_before": sess.get("wear_before"),
+            "wear_after": after["wear_pct"],
+            "full_before": sess.get("full_before"),
+            "full_after": after["energy_full"],
+            "lowest_charge": sess.get("min_seen"),
+        }
     if ok:
         cfg["battery"]["health_mode"] = restore
     save_config(cfg)
     print("battery calibration stopped.")
+    _print_calibration_result(cfg.get("battery", {}).get("last_calibration"))
     if ok:
         print(f"health limit restored to {'ON (cap ~80%)' if restore else 'OFF'}")
     else:
@@ -439,6 +462,33 @@ def _calibration_stop():
               f"writable) — set it again with: nitroctl battery "
               f"{'on' if restore else 'off'}", file=sys.stderr)
     return 0
+
+
+def _print_calibration_result(r):
+    """Before/after for a finished cycle. Reported honestly: the gauge can
+    revise capacity either way, and a rise in measured wear means the old
+    number was flattering, not that the battery got worse."""
+    if not isinstance(r, dict):
+        return
+    wb, wa = r.get("wear_before"), r.get("wear_after")
+    fb, fa = r.get("full_before"), r.get("full_after")
+    print(f"\ncalibrated {r.get('started', '?')} -> {r.get('finished', '?')}"
+          f"  (ran down to {r.get('lowest_charge', '?')}%)")
+    if wb is None or wa is None:
+        print("  wear: no before/after recorded")
+        return
+    delta = round(wa - wb, 1)
+    print(f"  wear     : {wb}%  ->  {wa}%   ({delta:+.1f} points)")
+    if fb and fa:
+        print(f"  capacity : {fb // 1000}  ->  {fa // 1000} mWh")
+    if abs(delta) < 0.5:
+        print("  the gauge was already accurate — the old figure stands")
+    elif delta < 0:
+        print("  the gauge had been understating capacity; the pack is healthier "
+              "than it looked")
+    else:
+        print("  the gauge had been overstating capacity; this is the truer "
+              "figure, not new damage")
 
 
 def _write_health_mode(on):
@@ -642,6 +692,12 @@ def print_status_human(s):
     if b.get("calibration_active"):
         print("  calibration  : RUNNING — leave it plugged in "
               "(nitroctl battery calibrate status)")
+    elif b.get("last_calibration"):
+        r = b["last_calibration"]
+        wb, wa = r.get("wear_before"), r.get("wear_after")
+        if wb is not None and wa is not None:
+            print(f"  calibration  : finished {r.get('finished', '?')}  "
+                  f"wear {wb}% -> {wa}%")
     print("Thermals")
     print(f"  CPU (k10temp): {s['cpu']['temp_c']} C")
     n = s["gpu"]["nvidia"]
