@@ -17,6 +17,10 @@ reboots, suspend and kernel updates** — the thing that actually matters.
 
 - 🔋 **Battery charge limit (80%)** that persists across cold boots, suspend/resume
   and kernel updates (re-asserted automatically — never silently resets again).
+- 🩺 **Battery gauge calibration** — a guided full discharge/recharge cycle so the
+  firmware's fuel gauge can re-learn the pack's real capacity, for when the
+  reported charge starts jumping or the wear figure looks wrong. The charge
+  limit is stood down for the duration and restored afterwards.
 - ⌨️ **4-zone RGB keyboard** with **35+ software effects**: rainbow, plasma, aurora,
   ocean, fire, candle, comet, meteor, breathe, wave, twinkle, lightning, matrix,
   vaporwave, police, heartbeat, disco, sunrise, and more.
@@ -62,6 +66,12 @@ Verified on: AN517-41, BIOS V1.08, Fedora 44, kernel 7.1.x, Ryzen 7 5800H + RTX 
   WMI driver (via the [`asan/acer-modules`](https://copr.fedorainfracloud.org/coprs/asan/acer-modules/)
   Copr as an akmod, so it rebuilds on kernel updates). A module option + systemd
   boot/resume unit re-assert the limit from `/etc/nitro-control/config.json`.
+  The same driver exposes `calibration_mode`, which drives gauge calibration.
+  That attribute is a value cached at module load and refreshed only when
+  something is written to it, so it can read stale; nitro-control records its
+  own session in `config.json` and treats that as the truth, stands `boot-apply`
+  down while a cycle runs (re-asserting the 80% limit would stop the pack
+  reaching full and stall it), and restores the previous limit when you finish.
 - **RGB**: the [`facer`](https://github.com/JafarAkhondali/acer-predator-turbo-and-rgb-keyboard-linux-module)
   kernel module (installed via DKMS), driven by a small persistent daemon that
   renders effects frame-by-frame over `/dev/acer-gkbbl-static-0`.
@@ -111,6 +121,7 @@ plus the exact rollback command.
 ```bash
 nitroctl status              # temps, battery, wear, capabilities, EC blanking
 nitroctl battery on|off      # 80% charge limit
+nitroctl battery calibrate status|start|stop      # re-learn the fuel gauge
 nitroctl kb ec-timeout 0     # firmware backlight blanking off (0-255 s)
 nitro-rgb-fx list            # list effects
 nitro-rgb-fx candle --color green --amplitude 2   # green, dramatic candle

@@ -275,6 +275,9 @@ class MainWindow(QMainWindow):
         self._last_effect = "gradient"
         self._is_off = False
         self.daemon_proc = None
+        # Last battery poll, so the calibration button can check AC and session
+        # state without shelling out again on every click.
+        self._last_batt = {}
 
         self.setWindowTitle("Nitro Control")
         self.setWindowIcon(make_icon())
@@ -360,12 +363,112 @@ class MainWindow(QMainWindow):
         il = QVBoxLayout(info)
         self.batt_wear = QLabel("—"); il.addWidget(self.batt_wear)
         lay.addWidget(info)
+        lay.addWidget(self._calibration_box())
         note = QLabel("Protects long-term battery lifespan. If already above 80 %, enabling won't "
                       "discharge — it just stops topping up on the next charge. Re-applied "
                       "automatically at every boot and resume, so it never silently resets.")
         note.setWordWrap(True); note.setObjectName("muted"); lay.addWidget(note)
         lay.addStretch()
         return w
+
+    def _calibration_box(self):
+        """Gauge calibration. Deliberately understated and hard to start by
+        accident: it takes hours, needs mains power, and turns the charge limit
+        off while it runs."""
+        box = QGroupBox("Gauge calibration")
+        cl = QVBoxLayout(box)
+        blurb = QLabel(
+            "Wear is estimated by the battery's own fuel gauge, and that estimate "
+            "drifts. A calibration cycle runs the pack down to empty and back to "
+            "full so the gauge can re-learn the real capacity — worth doing when "
+            "the reported charge starts jumping or wear looks off.")
+        blurb.setWordWrap(True); blurb.setObjectName("muted")
+        cl.addWidget(blurb)
+        self.calib_state = QLabel("—")
+        self.calib_state.setWordWrap(True)
+        self.calib_state.setStyleSheet("font-weight: 700;")
+        cl.addWidget(self.calib_state)
+        row = QHBoxLayout()
+        self.calib_btn = QPushButton("Start calibration…")
+        self.calib_btn.clicked.connect(self.on_calibrate)
+        row.addWidget(self.calib_btn); row.addStretch()
+        cl.addLayout(row)
+        return box
+
+    def on_calibrate(self):
+        """Start or stop a cycle, with a confirmation that spells out the cost."""
+        running = bool(self._last_batt.get("calibration_active"))
+        if running:
+            ok = QMessageBox.question(
+                self, "Finish calibration?",
+                "Stop the calibration cycle and put the charge limit back?\n\n"
+                "Only do this once the battery has charged back to full — "
+                "stopping early leaves the gauge no better than before.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ok != QMessageBox.Yes:
+                return
+            rc, out, err = nitroctl("battery", "calibrate", "stop")
+        else:
+            b = self._last_batt
+            if not b.get("ac_online"):
+                QMessageBox.warning(
+                    self, "Plug in first",
+                    "Calibration needs to charge the pack to full, so the AC "
+                    "adapter has to be connected before it can start.")
+                return
+            ok = QMessageBox.question(
+                self, "Start battery calibration?",
+                "This runs the battery down to empty and back to full so the "
+                "gauge can re-learn its capacity.\n\n"
+                "  • it takes several hours\n"
+                "  • leave the AC adapter plugged in the whole time\n"
+                "  • the 80 % charge limit is turned off until it finishes, "
+                "then restored\n"
+                "  • the laptop stays usable throughout\n\n"
+                "Start now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ok != QMessageBox.Yes:
+                return
+            rc, out, err = nitroctl("battery", "calibrate", "start")
+        self.refresh_once()
+        if rc != 0:
+            QMessageBox.warning(self, "Calibration",
+                                err or out or "nitroctl reported an error.")
+            return
+        first = (out or "").splitlines()[0] if out else (
+            "Calibration stopped" if running else "Calibration started")
+        self.tray.showMessage("Nitro Control", first, make_icon(), 4000)
+
+    def _sync_calibration(self, b):
+        """Reflect the battery poll into the calibration box."""
+        supported = bool(b.get("calibration_supported"))
+        running = supported and bool(b.get("calibration_active"))
+        # Turning the charge limit back on mid-cycle would stop the pack ever
+        # reaching full and quietly stall the calibration, so take it out of
+        # reach for the duration rather than letting it be undone by accident.
+        # Done before any early return, so the lock can never be left stuck on
+        # if the driver disappears while a cycle is recorded.
+        for wdg in (getattr(self, "batt_switch", None), getattr(self, "tray_limit", None)):
+            if wdg is not None:
+                wdg.setEnabled(not running)
+        if hasattr(self, "batt_switch"):
+            self.batt_switch.setToolTip(
+                "Paused while the battery is calibrating — it needs to charge "
+                "to full." if running else "")
+        self.calib_btn.setEnabled(supported)
+        if not supported:
+            self.calib_state.setText("Not supported by this firmware")
+            self.calib_btn.setText("Start calibration…")
+            return
+        if running:
+            self.calib_state.setText(
+                f"Running — charge {b.get('capacity', '?')} %, "
+                f"{'plugged in' if b.get('ac_online') else 'ON BATTERY — plug it back in'}. "
+                "Let it discharge fully and recharge, then finish.")
+            self.calib_btn.setText("Finish calibration…")
+        else:
+            self.calib_state.setText("Not running")
+            self.calib_btn.setText("Start calibration…")
 
     # ---- Keyboard ----
     def _keyboard_tab(self):
@@ -988,6 +1091,7 @@ class MainWindow(QMainWindow):
         if not s:
             return
         b = s.get("battery", {}); cpu = s.get("cpu", {}); gpu = s.get("gpu", {})
+        self._last_batt = b
         ct = cpu.get("temp_c")
         self.s_cpu.set(f"{ct} °C" if ct is not None else "n/a", temp_color(ct))
         nv = gpu.get("nvidia")
@@ -1017,6 +1121,7 @@ class MainWindow(QMainWindow):
                 f"Wear: {wear} %   (full charge holds {b.get('energy_full', 0) // 1000} of "
                 f"{b.get('energy_full_design', 0) // 1000} mWh original design)"
                 if wear is not None else "Wear: n/a")
+            self._sync_calibration(b)
 
     # ---- lifecycle ----
     def hideEvent(self, e):

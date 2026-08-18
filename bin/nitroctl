@@ -19,6 +19,7 @@ Subcommands:
   nitroctl status [--json]
   nitroctl caps [--json]
   nitroctl battery {on|off|toggle|status|apply-saved}
+  nitroctl battery calibrate {start|stop|status}   # re-learn the fuel gauge
   nitroctl kb <effect|off|list|apply-saved> [rgb-engine options...]
   nitroctl kb set-default <effect> [options...]
   nitroctl kb ec-timeout [0-255]   # firmware backlight blanking; 0 = off
@@ -39,6 +40,9 @@ VERSION = "0.1.0"
 BAT = "/sys/class/power_supply/BAT1"
 AC = "/sys/class/power_supply/ACAD"
 HEALTH_MODE = "/sys/bus/wmi/drivers/acer-wmi-battery/health_mode"
+# Battery gauge calibration. The driver reports -1 when the firmware doesn't
+# offer the mode at all, so "file exists" is not the same as "supported".
+CALIBRATION_MODE = "/sys/bus/wmi/drivers/acer-wmi-battery/calibration_mode"
 KB_DEV = "/dev/acer-gkbbl-0"
 # The EC's own backlight idle timeout, exposed by our nitro_kbd_timeout module.
 # The firmware defaults to 30 s and resets on every boot, so it has to be
@@ -179,6 +183,8 @@ def battery_info():
     ac = read_int(AC + "/online")
     return {
         "health_mode": (bool(hm) if hm is not None else None),
+        "calibration_supported": calibration_supported(),
+        "calibration_active": bool(calibration_session()),
         "capacity": read_int(BAT + "/capacity"),
         "status": read(BAT + "/status"),
         "ac_online": (bool(ac) if ac is not None else None),
@@ -210,6 +216,164 @@ def battery_set(on):
     save_config(cfg)
     print(f"battery health mode: {'ON (cap ~80%)' if on else 'OFF (full charge)'}")
     return 0
+
+
+# ---- battery calibration -----------------------------------------------------
+# A calibration cycle lets the pack run down to empty and back to full so the
+# firmware's fuel gauge can re-learn the true capacity. Two things make this
+# more than a one-line sysfs write:
+#
+#   * The ~80% health limit must be off for the duration, or the pack can never
+#     reach full and the cycle cannot complete. The previous setting is recorded
+#     so it can be put back afterwards.
+#   * boot-apply re-asserts the health limit on every boot and resume. Left
+#     alone it would silently switch the limit back on mid-cycle and stall the
+#     calibration, so it stands down while a session is recorded.
+#
+# The driver's calibration_mode attribute is a value cached at module load and
+# refreshed only when something is written to health_mode or calibration_mode;
+# nothing re-reads the firmware in the background. So it can read stale, and
+# the session record in config.json - not sysfs - is what we treat as the truth
+# about whether *we* started a cycle.
+
+def calibration_supported():
+    v = read_int(CALIBRATION_MODE)
+    return v is not None and v >= 0
+
+
+def calibration_session():
+    """The calibration session we started, if any."""
+    s = load_config().get("battery", {}).get("calibration")
+    return s if isinstance(s, dict) and s.get("active") else None
+
+
+def _set_calibration(on):
+    try:
+        with open(CALIBRATION_MODE, "w") as f:
+            f.write("1" if on else "0")
+        return True
+    except Exception:
+        return False
+
+
+def battery_calibrate(args):
+    sub = args[0] if args else "status"
+    if sub not in ("start", "stop", "status"):
+        print("usage: nitroctl battery calibrate {start|stop|status}", file=sys.stderr)
+        return 2
+    if not os.path.exists(CALIBRATION_MODE):
+        print("error: acer-wmi-battery not loaded (no calibration_mode)", file=sys.stderr)
+        return 2
+    if not calibration_supported():
+        print("battery calibration is not supported by this firmware", file=sys.stderr)
+        return 2
+    if sub == "status":
+        return _calibration_status()
+    if sub == "start":
+        return _calibration_start()
+    return _calibration_stop()
+
+
+def _calibration_status():
+    sess = calibration_session()
+    b = battery_info()
+    raw = read_int(CALIBRATION_MODE)
+    print(f"calibration mode : {'ON' if raw else 'off'}  (driver value; "
+          f"refreshed only on write, so it can lag)")
+    if sess:
+        print(f"session          : started {sess.get('started', '?')}")
+        print(f"                   health limit will be restored to "
+              f"{'ON' if sess.get('restore_health_mode') else 'OFF'} when you stop")
+    else:
+        print("session          : none started by nitro-control")
+    print(f"charge           : {b['capacity']}%  ({b['status']})")
+    print(f"AC               : {'plugged' if b['ac_online'] else 'on battery'}")
+    if sess:
+        print("\nLeave the laptop plugged in. The pack will run down to empty and\n"
+              "back to full on its own; when it reads full again, finish with:\n"
+              "  nitroctl battery calibrate stop")
+    return 0
+
+
+def _calibration_start():
+    if calibration_session():
+        print("a calibration session is already running "
+              "(nitroctl battery calibrate status)", file=sys.stderr)
+        return 1
+    b = battery_info()
+    if not b["ac_online"]:
+        print("error: plug in the AC adapter first — calibration needs to charge "
+              "the pack to full, and must not be interrupted", file=sys.stderr)
+        return 1
+    cfg = load_config()
+    prev = bool(cfg.get("battery", {}).get("health_mode", True))
+    # Drop the limit first: with it on the pack stops at ~80% and the cycle
+    # can never finish. Do this before enabling calibration so there is no
+    # window where calibration is on but the charge is still capped.
+    if prev and not _write_health_mode(False):
+        print(f"error: no write access to {HEALTH_MODE}; run via sudo/pkexec",
+              file=sys.stderr)
+        return 1
+    if not _set_calibration(True):
+        if prev:
+            _write_health_mode(True)     # put the limit back, we changed nothing
+        print(f"error: no write access to {CALIBRATION_MODE}; run via sudo/pkexec",
+              file=sys.stderr)
+        return 1
+    cfg.setdefault("battery", {})["calibration"] = {
+        "active": True,
+        "restore_health_mode": prev,
+        "started": _now(),
+    }
+    # Keep the recorded health_mode in step with the hardware, so nothing else
+    # reads config.json and re-asserts the limit behind our back.
+    cfg["battery"]["health_mode"] = False
+    save_config(cfg)
+    print("battery calibration started.\n"
+          f"  · the ~80% health limit is off for the duration"
+          f"{' (it was on; it will be restored)' if prev else ''}\n"
+          "  · leave the AC adapter plugged in and let it run — it takes hours\n"
+          "  · the pack will discharge to empty and recharge to full\n"
+          "  · when it reads full again: nitroctl battery calibrate stop")
+    return 0
+
+
+def _calibration_stop():
+    sess = calibration_session()
+    if not _set_calibration(False):
+        print(f"error: no write access to {CALIBRATION_MODE}; run via sudo/pkexec",
+              file=sys.stderr)
+        return 1
+    cfg = load_config()
+    restore = bool(sess.get("restore_health_mode", True)) if sess else \
+        bool(cfg.get("battery", {}).get("health_mode", True))
+    ok = _write_health_mode(restore)
+    cfg.setdefault("battery", {})["calibration"] = {"active": False}
+    if ok:
+        cfg["battery"]["health_mode"] = restore
+    save_config(cfg)
+    print("battery calibration stopped.")
+    if ok:
+        print(f"health limit restored to {'ON (cap ~80%)' if restore else 'OFF'}")
+    else:
+        print(f"warning: could not restore the health limit ({HEALTH_MODE} not "
+              f"writable) — set it again with: nitroctl battery "
+              f"{'on' if restore else 'off'}", file=sys.stderr)
+    return 0
+
+
+def _write_health_mode(on):
+    try:
+        with open(HEALTH_MODE, "w") as f:
+            f.write("1" if on else "0")
+        return True
+    except Exception:
+        return False
+
+
+def _now():
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 # ---- keyboard (delegates to the RGB engine) ----------------------------------
@@ -337,10 +501,11 @@ def fix_perms():
         print(f"group '{NITRO_GROUP}' does not exist; run the installer first", file=sys.stderr)
         return 1
     import shutil
-    if os.path.exists(HEALTH_MODE):
-        shutil.chown(HEALTH_MODE, group=NITRO_GROUP)
-        os.chmod(HEALTH_MODE, 0o664)
-        print(f"fixed perms on {HEALTH_MODE}")
+    for attr in (HEALTH_MODE, CALIBRATION_MODE):
+        if os.path.exists(attr):
+            shutil.chown(attr, group=NITRO_GROUP)
+            os.chmod(attr, 0o664)
+            print(f"fixed perms on {attr}")
     if CONFIG_DIR.exists():
         shutil.chown(CONFIG_DIR, group=NITRO_GROUP)
         os.chmod(CONFIG_DIR, 0o775)
@@ -354,7 +519,11 @@ def boot_apply():
     fix_perms()
     cfg = load_config()
     on = cfg.get("battery", {}).get("health_mode", True)
-    if os.path.exists(HEALTH_MODE):
+    # Stand down mid-calibration: re-asserting the ~80% limit here would stop
+    # the pack ever reaching full and quietly stall the cycle.
+    if calibration_session():
+        print("boot-apply: calibration in progress, leaving the health limit off")
+    elif os.path.exists(HEALTH_MODE):
         try:
             open(HEALTH_MODE, "w").write("1" if on else "0")
         except Exception as e:
@@ -391,6 +560,9 @@ def print_status_human(s):
     print(f"  AC           : {'plugged' if b['ac_online'] else 'on battery' if b['ac_online'] is not None else 'n/a'}")
     if b["wear_pct"] is not None:
         print(f"  wear         : {b['wear_pct']}%")
+    if b.get("calibration_active"):
+        print("  calibration  : RUNNING — leave it plugged in "
+              "(nitroctl battery calibrate status)")
     print("Thermals")
     print(f"  CPU (k10temp): {s['cpu']['temp_c']} C")
     n = s["gpu"]["nvidia"]
@@ -450,6 +622,8 @@ def main(argv):
             return battery_set(not cur)
         if sub == "apply-saved":
             return battery_set(load_config().get("battery", {}).get("health_mode", True))
+        if sub == "calibrate":
+            return battery_calibrate(rest[1:])
         b = battery_info()
         print(json.dumps(b, indent=2) if want_json else
               f"health limit: {'ON' if b['health_mode'] else 'OFF' if b['health_mode'] is not None else 'n/a'}")
