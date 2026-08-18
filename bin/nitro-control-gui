@@ -442,16 +442,14 @@ class MainWindow(QMainWindow):
         self.autooff.setCurrentIndex(self.autooff.count() - 1)  # default: Never
         self.autooff.currentIndexChanged.connect(lambda *_: self.schedule_apply())
         sg.addWidget(self.autooff, 3, 1)
-        sg.addWidget(QLabel("Wake on"), 4, 0)
-        self.wakesrc = QComboBox()
-        self.wakesrc.addItem("Keyboard only", "keyboard")
-        self.wakesrc.addItem("Keyboard + touchpad", "any")
-        self.wakesrc.currentIndexChanged.connect(lambda *_: self.schedule_apply())
-        sg.addWidget(self.wakesrc, 4, 1)
+        sg.addWidget(QLabel("Touchpad wakes lights"), 4, 0)
+        self.wakepad = ToggleSwitch()
+        self.wakepad.toggled.connect(lambda *_: self._sync_wake_hint())
+        self.wakepad.toggled.connect(lambda *_: self.schedule_apply())
+        sg.addWidget(self.wakepad, 4, 1)
         self.autooff_hint = QLabel()
         self.autooff_hint.setObjectName("muted")
         sg.addWidget(self.autooff_hint, 5, 1, 1, 2)
-        self.wakesrc.currentIndexChanged.connect(lambda *_: self._sync_wake_hint())
         self._sync_wake_hint()
         panel.addWidget(sbox)
         panel.addWidget(self._sound_box())
@@ -706,11 +704,13 @@ class MainWindow(QMainWindow):
                     self.autooff.setCurrentIndex(i)
                     self.autooff.blockSignals(False)
                     break
+        self.wakepad.blockSignals(True)
+        self.wakepad.setChecked(st.get("wake_source", "keyboard") == "any")
+        self.wakepad.blockSignals(False)
         for combo, key, default in ((self.basszone, "bass_zone", 4),
                                     (self.vudir, "vu_reverse", False),
                                     (self.vusrc, "vu_source", "full"),
-                                    (self.specdir, "spec_reverse", False),
-                                    (self.wakesrc, "wake_source", "keyboard")):
+                                    (self.specdir, "spec_reverse", False)):
             val = st.get(key, default)
             for i in range(combo.count()):
                 if combo.itemData(i) == val:
@@ -730,7 +730,7 @@ class MainWindow(QMainWindow):
 
     def _sync_wake_hint(self):
         """Keep the idle hint honest about what actually wakes the lights."""
-        if self.wakesrc.currentData() == "any":
+        if self.wakepad.isChecked():
             self.autooff_hint.setText(
                 "Counts from your last keypress or touchpad move, and fades\n"
                 "back up the moment you touch either.")
@@ -776,7 +776,7 @@ class MainWindow(QMainWindow):
             "effect": effect if effect is not None else self.current_key(),
             "color": (None if self.auto_color else self.color),
             "idle_off": int(self.autooff.currentData() or 0),
-            "wake_source": self.wakesrc.currentData() or "keyboard",
+            "wake_source": "any" if self.wakepad.isChecked() else "keyboard",
             "zone_colors": (",".join(c or "" for c in self.zone_colors)
                             if any(self.zone_colors) else None),
             "bass_zone": int(self.basszone.currentData() or 4),
